@@ -87,3 +87,11 @@ QuantDinger-Vue-src/src/locales/lang/*.bak
 # Docker
 # ========================
 docker-compose.override.yml
+
+
+# ========================
+# Scripts runtime output
+# ========================
+backend_api_python/scripts/kline_cache/
+backend_api_python/scripts/backtest_result.json
+backend_api_python/scripts/top_symbols_output.json
