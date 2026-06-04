@@ -4090,42 +4090,92 @@ class TradingExecutor:
             with get_db_connection() as db:
                 cursor = db.cursor()
                 cursor.execute("""
-                    SELECT id, symbol, side, size, entry_price, current_price, highest_price, lowest_price
-                    FROM qd_strategy_positions
-                    WHERE strategy_id = %s
+                    SELECT p.id, p.symbol, p.side, p.size, p.entry_price, p.current_price,
+                           p.highest_price, p.lowest_price, p.breakeven_activated, p.trail_level,
+                           p.breakout_vol, p.stop_loss_price,
+                           MIN(t.created_at) AS opened_at
+                    FROM qd_strategy_positions p
+                    LEFT JOIN qd_strategy_trades t
+                        ON t.strategy_id = p.strategy_id
+                        AND t.symbol = p.symbol
+                        AND t.type IN ('open_long', 'open_short')
+                    WHERE p.strategy_id = %s
+                    GROUP BY p.id, p.symbol, p.side, p.size, p.entry_price, p.current_price,
+                             p.highest_price, p.lowest_price, p.breakeven_activated, p.trail_level,
+                             p.breakout_vol, p.stop_loss_price
                 """, (strategy_id,))
                 return cursor.fetchall() or []
         except Exception as e:
             logger.error(f"Failed to get all positions: {e}")
             return []
     
-    def _should_rebalance(self, strategy_id: int, rebalance_frequency: str) -> bool:
-        """检查是否应该调仓"""
+    def _should_rebalance(self, strategy_id: int, rebalance_frequency: str, trading_config: Optional[Dict[str, Any]] = None) -> bool:
+        """检查是否应该调仓。
+
+        支持两种模式：
+        1. 固定时间触发：trading_config 中设置 rebalance_time（格式 "HH:MM"，北京时间 CST=UTC+8）。
+           每天到达指定时刻且当天尚未调仓时触发。
+        2. 间隔触发（原有逻辑）：按 rebalance_frequency（daily/weekly/monthly）距上次调仓时长判断。
+        """
         try:
             with get_db_connection() as db:
                 cursor = db.cursor()
-                cursor.execute("""
-                    SELECT last_rebalance_at FROM qd_strategies_trading WHERE id = %s
-                """, (strategy_id,))
+                cursor.execute("SELECT last_rebalance_at FROM qd_strategies_trading WHERE id = %s", (strategy_id,))
                 result = cursor.fetchone()
-                if not result or not result.get('last_rebalance_at'):
-                    return True
-                
+                cursor.close()
+
+            last_rebalance = None
+            if result and result.get('last_rebalance_at'):
                 last_rebalance = result['last_rebalance_at']
                 if isinstance(last_rebalance, str):
-                    from datetime import datetime
                     last_rebalance = datetime.fromisoformat(last_rebalance.replace('Z', '+00:00'))
-                
-                now = datetime.now()
-                delta = now - last_rebalance
-                
-                if rebalance_frequency == 'daily':
-                    return delta.days >= 1
-                elif rebalance_frequency == 'weekly':
-                    return delta.days >= 7
-                elif rebalance_frequency == 'monthly':
-                    return delta.days >= 30
+
+            rebalance_time = (trading_config or {}).get('rebalance_time', '').strip()  # e.g. "00:05"
+            if rebalance_time:
+                import pytz
+                cst = pytz.timezone('Asia/Shanghai')
+                now_cst = datetime.now(cst)
+                try:
+                    hh, mm = [int(x) for x in rebalance_time.split(':')]
+                except ValueError:
+                    logger.warning(f"Invalid rebalance_time format: {rebalance_time!r}, expected HH:MM")
+                    hh, mm = 0, 5
+
+                # 判断当前时刻是否在目标窗口内（±5分钟），且今天还未调仓
+                target = now_cst.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                in_window = abs((now_cst - target).total_seconds()) <= 300
+
+                if not in_window:
+                    return False
+
+                if last_rebalance is None:
+                    return True
+
+                # last_rebalance 可能是 naive（DB 存的是 server local time）
+                if last_rebalance.tzinfo is None:
+                    last_rebalance_cst = cst.localize(last_rebalance)
+                else:
+                    last_rebalance_cst = last_rebalance.astimezone(cst)
+
+                # 今天已经调仓过了就跳过
+                return last_rebalance_cst.date() < now_cst.date()
+
+            # ── 原有间隔触发逻辑 ──────────────────────────────────────────
+            if last_rebalance is None:
                 return True
+
+            now = datetime.now()
+            if last_rebalance.tzinfo is not None:
+                last_rebalance = last_rebalance.replace(tzinfo=None)
+            delta = now - last_rebalance
+
+            if rebalance_frequency == 'daily':
+                return delta.days >= 1
+            elif rebalance_frequency == 'weekly':
+                return delta.days >= 7
+            elif rebalance_frequency == 'monthly':
+                return delta.days >= 30
+            return True
         except Exception as e:
             logger.error(f"Failed to check rebalance: {e}")
             return True
@@ -4150,6 +4200,96 @@ class TradingExecutor:
         except Exception as e:
             logger.warning(f"Failed to update last_rebalance_at: {e}")
     
+    def _fetch_fresh_symbol_list(self, trading_config: Dict[str, Any]) -> Optional[List[str]]:
+        """从交易所按24h成交额拉取最新标的列表，用于自动刷新截面策略 symbol_list。"""
+        try:
+            import ccxt
+
+            market_type = (trading_config.get('market_type') or 'swap').lower()
+            top_n = int(trading_config.get('symbol_refresh_top_n') or 100)
+            min_volume = float(trading_config.get('symbol_refresh_min_volume') or 5_000_000)
+
+            exchange = ccxt.binanceusdm({'enableRateLimit': True}) if market_type == 'swap' else ccxt.binance({'enableRateLimit': True})
+
+            logger.info("Fetching 24h tickers from Binance for symbol list refresh...")
+            tickers = exchange.fetch_tickers()
+
+            EXCLUDE_BASES = {"USDC", "BUSD", "TUSD", "USDP", "DAI", "FDUSD", "BTCDOM", "DEFI", "ALTDOM"}
+            EXCLUDE_SUFFIXES = ("UP", "DOWN", "3L", "3S", "5L", "5S", "BULL", "BEAR")
+
+            candidates = []
+            for symbol, t in tickers.items():
+                if not (symbol.endswith("/USDT") or symbol.endswith("/USDT:USDT")):
+                    continue
+                price = float(t.get("last") or 0)
+                change_pct = float(t.get("percentage") or 0)
+                quote_vol = float(t.get("quoteVolume") or 0)
+                if quote_vol < min_volume:
+                    continue
+                base = symbol.split("/")[0]
+                if base in EXCLUDE_BASES:
+                    continue
+                if any(base.endswith(s) for s in EXCLUDE_SUFFIXES):
+                    continue
+                if not base.isascii() or not all(c.isalnum() for c in base):
+                    continue
+                if len(base) < 2 or len(base) > 10:
+                    continue
+                if price > 0 and price < 0.000001:
+                    continue
+                if abs(change_pct) > 50:
+                    continue
+                clean = symbol.split(":")[0]
+                candidates.append((quote_vol, clean))
+
+            candidates.sort(reverse=True)
+            result = [f"Crypto:{sym}" for _, sym in candidates[:top_n]]
+            logger.info(f"Symbol list refresh: fetched {len(result)} symbols from Binance")
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to fetch fresh symbol list: {e}")
+            return None
+
+    def _refresh_symbol_list_if_needed(
+        self, strategy_id: int, trading_config: Dict[str, Any], symbol_list: List[str]
+    ) -> List[str]:
+        """如果距上次刷新已超过 symbol_refresh_days 天，自动更新标的列表。"""
+        refresh_days = int(trading_config.get('symbol_refresh_days') or 0)
+        if refresh_days <= 0:
+            return symbol_list
+
+        last_refresh_str = trading_config.get('last_symbol_refresh_at')
+        if last_refresh_str:
+            try:
+                last_refresh = datetime.fromisoformat(last_refresh_str)
+                if (datetime.utcnow() - last_refresh).days < refresh_days:
+                    return symbol_list
+            except Exception:
+                pass
+
+        logger.info(f"Strategy {strategy_id}: refreshing symbol list (every {refresh_days} days)...")
+        new_list = self._fetch_fresh_symbol_list(trading_config)
+        if not new_list:
+            logger.warning(f"Strategy {strategy_id}: symbol list refresh failed, keeping existing list")
+            return symbol_list
+
+        trading_config['symbol_list'] = new_list
+        trading_config['last_symbol_refresh_at'] = datetime.utcnow().isoformat()
+        try:
+            with get_db_connection() as db:
+                c = db.cursor()
+                c.execute(
+                    "UPDATE qd_strategies_trading SET trading_config = %s WHERE id = %s",
+                    (json.dumps(trading_config, ensure_ascii=False), strategy_id),
+                )
+                db.commit()
+                c.close()
+            logger.info(f"Strategy {strategy_id}: symbol list updated to {len(new_list)} symbols and persisted to DB")
+        except Exception as e:
+            logger.warning(f"Strategy {strategy_id}: failed to persist refreshed symbol list: {e}")
+
+        return new_list
+
     def _execute_cross_sectional_indicator(
         self,
         indicator_code: str,
@@ -4168,8 +4308,11 @@ class TradingExecutor:
             all_data = {}
             for symbol in symbols:
                 try:
+                    # symbol_list 格式为 "Market:BASE/QUOTE"（如 "Crypto:BTC/USDT"）
+                    # _fetch_latest_kline 只需要 "BASE/QUOTE" 部分
+                    raw_symbol = symbol.split(":", 1)[-1] if ":" in symbol else symbol
                     klines = self._fetch_latest_kline(
-                        symbol, timeframe, limit=200, market_category=market_category,
+                        raw_symbol, timeframe, limit=400, market_category=market_category,
                         exchange_id=exchange_id, market_type=market_type,
                     )
                     if klines and len(klines) >= 2:
@@ -4179,7 +4322,7 @@ class TradingExecutor:
                 except Exception as e:
                     logger.warning(f"Failed to fetch data for {symbol}: {e}")
                     continue
-            
+
             if not all_data:
                 logger.error("No data available for cross-sectional strategy")
                 return None
@@ -4189,6 +4332,7 @@ class TradingExecutor:
                 'symbols': list(all_data.keys()),
                 'data': all_data,  # {symbol: df}
                 'scores': {},  # 用于存储评分
+                'signal_types': {},  # 可选：{symbol: '二买'/'三买'}，indicator_code 可写入
                 'rankings': [],  # 用于存储排序
                 'np': np,
                 'pd': pd,
@@ -4209,15 +4353,20 @@ class TradingExecutor:
                 raise ValueError(f"Cross-sectional indicator failed: {exec_result['error']}")
             
             scores = exec_env.get('scores', {})
+            signal_types = exec_env.get('signal_types', {})
             rankings = exec_env.get('rankings', [])
-            
+            stop_prices = exec_env.get('stop_prices', {})
+
             # 如果没有提供rankings，根据scores排序
             if not rankings and scores:
                 rankings = sorted(scores.keys(), key=lambda x: scores.get(x, 0), reverse=True)
-            
+
             return {
                 'scores': scores,
-                'rankings': rankings
+                'signal_types': signal_types,
+                'rankings': rankings,
+                'stop_prices': stop_prices,
+                'all_data': all_data,
             }
         except Exception as e:
             logger.error(f"Failed to execute cross-sectional indicator: {e}")
@@ -4229,20 +4378,39 @@ class TradingExecutor:
         strategy_id: int,
         rankings: List[str],
         scores: Dict[str, float],
-        trading_config: Dict[str, Any]
+        trading_config: Dict[str, Any],
+        stop_prices: Optional[Dict[str, float]] = None,
+        all_data: Optional[Dict[str, Any]] = None,
+        signal_types: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         根据排序结果生成截面策略信号
         """
         portfolio_size = trading_config.get('portfolio_size', 10)
         long_ratio = float(trading_config.get('long_ratio', 0.5))
-        
-        # 选择持仓标的
-        long_count = int(portfolio_size * long_ratio)
-        short_count = portfolio_size - long_count
-        
-        long_symbols = set(rankings[:long_count]) if long_count > 0 else set()
-        short_symbols = set(rankings[-short_count:]) if short_count > 0 and len(rankings) >= short_count else set()
+        abs_score_ranking = bool(trading_config.get('abs_score_ranking', False))
+
+        # ── Symbol 归一化：统一去掉 "Market:" 前缀，与 DB raw symbol 一致 ────────
+        # rankings / scores / stop_prices / kdata 的 key 来自 INDICATOR_CODE，
+        # 带 "Crypto:" 前缀；而 DB 存储的 symbol 是无前缀的 raw 格式。
+        _norm = lambda s: s.split(':', 1)[-1] if ':' in s else s
+        _trail_stop_mult = self._trail_stop_mult
+        _trail_lock_label = self._trail_lock_label
+        rankings = [_norm(s) for s in rankings]
+        scores   = {_norm(k): v for k, v in scores.items()}
+        _signal_types = {_norm(k): v for k, v in (signal_types or {}).items()}
+
+        if abs_score_ranking:
+            # 按绝对值取前 N，方向由 score 符号决定
+            top_n = rankings[:portfolio_size]
+            long_symbols  = {s for s in top_n if (scores.get(s) or 0) > 0}
+            short_symbols = {s for s in top_n if (scores.get(s) or 0) < 0}
+        else:
+            # 原有逻辑：固定比例多空
+            long_count  = int(portfolio_size * long_ratio)
+            short_count = portfolio_size - long_count
+            long_symbols  = set(rankings[:long_count]) if long_count > 0 else set()
+            short_symbols = set(rankings[-short_count:]) if short_count > 0 and len(rankings) >= short_count else set()
         
         # 获取当前持仓
         current_positions = self._get_all_positions(strategy_id)
@@ -4250,39 +4418,220 @@ class TradingExecutor:
         current_short = {p['symbol'] for p in current_positions if p.get('side') == 'short'}
         
         signals = []
-        
+        min_hold_hours = float(trading_config.get('min_hold_hours', 0))
+        breakeven_trigger = float(trading_config.get('breakeven_trigger_pct', 10)) / 100
+        _stop_prices = {_norm(k): v for k, v in (stop_prices or {}).items()}
+
+        # ── 止损检查：跌破有效止损位立即平仓（不受最短持仓限制）──────────
+        stop_loss_symbols: set = set()
+        for pos in current_positions:
+            side        = (pos.get('side') or '').strip().lower()
+            sym         = pos.get('symbol', '')
+            cur_px      = float(pos.get('current_price') or 0)
+            entry_px    = float(pos.get('entry_price') or 0)
+            # 优先用 DB 里开仓时记录的结构止损价；
+            # 当次指标产出的新止损价只在更高（更有利）时才覆盖（止损只升不降）
+            db_stop     = float(pos.get('stop_loss_price') or 0)
+            indicator_stop = _stop_prices.get(sym, 0)
+            if side == 'long':
+                struct_stop = max(db_stop, indicator_stop) if (db_stop > 0 and indicator_stop > 0) else (db_stop or indicator_stop)
+            else:
+                # 空头止损：取更低值（更有利）
+                struct_stop = min(db_stop, indicator_stop) if (db_stop > 0 and indicator_stop > 0) else (db_stop or indicator_stop)
+
+            if struct_stop <= 0 or cur_px <= 0:
+                continue
+
+            already_level = int(pos.get('trail_level') or 0)
+
+            if side == 'long':
+                # 阶梯式锁利：只升不降
+                # 10%保本, 50%→锁20%, 100%→锁50%, 200%→锁100%, 300%→锁200%, 依此类推
+                float_pct = (cur_px / entry_px - 1) * 100 if entry_px > 0 else 0
+                if float_pct >= 300:
+                    new_level = int(float_pct // 100) + 2   # 300%→5, 400%→6 …
+                elif float_pct >= 200:
+                    new_level = 4
+                elif float_pct >= 100:
+                    new_level = 3
+                elif float_pct >= 50:
+                    new_level = 2
+                elif float_pct >= breakeven_trigger * 100:
+                    new_level = 1
+                else:
+                    new_level = 0
+                now_level = max(already_level, new_level)
+
+                if now_level > already_level:
+                    try:
+                        with get_db_connection() as _db:
+                            _c = _db.cursor()
+                            _c.execute(
+                                "UPDATE qd_strategy_positions SET trail_level = %s, breakeven_activated = TRUE WHERE strategy_id = %s AND symbol = %s AND side = %s",
+                                (now_level, strategy_id, sym, side),
+                            )
+                            _db.commit()
+                            _c.close()
+                        label = _trail_lock_label(now_level)
+                        logger.info(f"Trail level {now_level} ({label}): {sym} entry={entry_px:.6f} cur={cur_px:.6f}")
+                    except Exception as _e:
+                        logger.warning(f"Failed to persist trail_level for {sym}: {_e}")
+
+                if now_level > 0:
+                    effective_stop = max(struct_stop, entry_px * _trail_stop_mult(now_level))
+                else:
+                    effective_stop = struct_stop
+                triggered = cur_px < effective_stop
+
+            elif side == 'short':
+                now_level = max(already_level, 1 if (entry_px > 0 and cur_px <= entry_px * (1 - breakeven_trigger)) else 0)
+                if now_level > already_level:
+                    try:
+                        with get_db_connection() as _db:
+                            _c = _db.cursor()
+                            _c.execute(
+                                "UPDATE qd_strategy_positions SET trail_level = %s, breakeven_activated = TRUE WHERE strategy_id = %s AND symbol = %s AND side = %s",
+                                (now_level, strategy_id, sym, side),
+                            )
+                            _db.commit()
+                            _c.close()
+                    except Exception as _e:
+                        logger.warning(f"Failed to persist trail_level for {sym}: {_e}")
+                effective_stop = min(struct_stop, entry_px) if now_level > 0 else struct_stop
+                triggered = cur_px > effective_stop
+
+            else:
+                continue
+
+            if triggered:
+                stop_loss_symbols.add(sym)
+                label = ("保本" if now_level == 1 else f"锁利{(now_level-1)*100}%") if now_level > 0 else "结构止损"
+                logger.info(
+                    f"Stop-loss triggered [{label}]: {sym} side={side} cur={cur_px:.6f} "
+                    f"stop={effective_stop:.6f} entry={entry_px:.6f} trail={now_level}"
+                )
+                close_type = 'close_long' if side == 'long' else 'close_short'
+                signals.append({'symbol': sym, 'type': close_type, 'score': -999, 'reason': 'stop_loss'})
+
+        # ── 量缩横盘出场：突破后量能萎缩且价格未有效上涨，平仓止损 ────────
+        _kdata = {_norm(k): v for k, v in (all_data or {}).items()}
+        VOL_CONSOL_BARS  = 42        # 7天 × 6根4H
+        VOL_CONSOL_PCT   = 0.08      # 价格未超过入场价 +8% 视为无效突破
+        VOL_SHRINK_RATIO = 0.60      # 近期均量 < 突破量 × 60%
+        VOL_MIN_HOLD_H   = 72        # 至少持仓 72h 后才检查
+        vol_exit_symbols: set = set()
+        for pos in current_positions:
+            sym      = pos.get('symbol', '')
+            side     = (pos.get('side') or '').strip().lower()
+            if side != 'long':
+                continue
+            if sym in stop_loss_symbols:
+                continue
+            entry_px     = float(pos.get('entry_price') or 0)
+            breakout_vol = float(pos.get('breakout_vol') or 0)
+            if entry_px <= 0 or breakout_vol <= 0:
+                continue
+            opened_at = pos.get('opened_at')
+            if opened_at:
+                if isinstance(opened_at, str):
+                    opened_at = datetime.fromisoformat(opened_at.replace('Z', '+00:00'))
+                held_h = (datetime.now(opened_at.tzinfo) if opened_at.tzinfo else datetime.now() - opened_at).total_seconds() / 3600
+                if held_h < VOL_MIN_HOLD_H:
+                    continue
+            # _kdata 已归一化为 raw symbol，直接查
+            df_sym = _kdata.get(sym)
+            if df_sym is None or len(df_sym) < VOL_CONSOL_BARS:
+                continue
+            recent      = df_sym.tail(VOL_CONSOL_BARS)
+            recent_high = float(recent['close'].max())
+            recent_vol  = float(recent['volume'].astype(float).mean())
+            price_no_breakout = recent_high <= entry_px * (1 + VOL_CONSOL_PCT)
+            vol_shrunk        = recent_vol < breakout_vol * VOL_SHRINK_RATIO
+            if price_no_breakout and vol_shrunk:
+                vol_exit_symbols.add(sym)
+                logger.info(
+                    f"Vol-shrink exit: {sym} entry={entry_px:.6f} recent_high={recent_high:.6f} "
+                    f"avg_vol={recent_vol:.0f} breakout_vol×{VOL_SHRINK_RATIO}={breakout_vol*VOL_SHRINK_RATIO:.0f}"
+                )
+                signals.append({'symbol': sym, 'type': 'close_long', 'score': -998, 'reason': 'vol_shrink_exit'})
+
+        # ── 冷却期检查：止损/量缩横盘平仓后 5 天内禁止同标的重入 ────────────
+        COOLDOWN_DAYS = 5
+
+        def _in_cooldown(sym: str) -> bool:
+            try:
+                with get_db_connection() as _db:
+                    _c = _db.cursor()
+                    _c.execute(
+                        "SELECT COUNT(*) AS cnt FROM qd_strategy_trades "
+                        "WHERE strategy_id = %s AND symbol = %s "
+                        "AND type IN ('close_long', 'close_short') "
+                        "AND created_at >= NOW() - INTERVAL '5 days'",
+                        (strategy_id, sym),
+                    )
+                    row = _c.fetchone() or {}
+                    _c.close()
+                    return int(row.get('cnt') or 0) > 0
+            except Exception:
+                return False
+
         # 生成做多信号
         for symbol in long_symbols:
             if symbol not in current_long:
-                # 如果当前没有多仓，开多
+                # 冷却期检查（止损/量缩横盘后 5 天内禁止重入）
+                if _in_cooldown(symbol):
+                    logger.info(f"Cooldown: skip open_long {symbol} (recent close within {COOLDOWN_DAYS}d)")
+                    continue
+                # 止损方向校验：多头止损必须在当前价下方
+                _stop_px = _stop_prices.get(symbol, 0)
+                if _stop_px > 0:
+                    _df_chk = _kdata.get(symbol)
+                    if _df_chk is not None and len(_df_chk) > 0:
+                        _cur_px_chk = float(_df_chk['close'].iloc[-1])
+                        if _stop_px >= _cur_px_chk:
+                            logger.warning(
+                                f"Stop direction invalid: {symbol} stop={_stop_px:.6g} >= cur={_cur_px_chk:.6g}, skip open"
+                            )
+                            continue
+                # 如果当前是空仓，先平空再开多
                 if symbol in current_short:
-                    # 如果当前是空仓，先平空再开多
                     signals.append({
                         'symbol': symbol,
                         'type': 'close_short',
                         'score': scores.get(symbol, 0)
                     })
+                # 计算突破量能（入场前 40 根最大成交量）
+                _bvol = 0.0
+                _df_s = _kdata.get(symbol)
+                if _df_s is not None and len(_df_s) >= 40:
+                    _bvol = float(_df_s['volume'].astype(float).tail(40).max())
+                _score_val = scores.get(symbol, 0)
+                _stop_px = _stop_prices.get(symbol) or 0
+                _cur_px_log = float(_df_s['close'].iloc[-1]) if _df_s is not None and len(_df_s) > 0 else 0
+                # 优先用 indicator_code 写入的精确类型，否则按分值推测
+                _sig_type = _signal_types.get(symbol) or ('二买' if _score_val > 65 else '三买')
+                logger.info(
+                    f"[开仓信号] {symbol} open_long | 评分={_score_val:.1f} 类型={_sig_type} "
+                    f"止损={_stop_px:.6g} 当前={_cur_px_log:.6g}"
+                )
+                append_strategy_log(
+                    strategy_id, "info",
+                    f"开仓 {symbol} | 评分={_score_val:.1f} [{_sig_type}] 止损={_stop_px:.6g} 当前={_cur_px_log:.6g}",
+                )
                 signals.append({
                     'symbol': symbol,
                     'type': 'open_long',
-                    'score': scores.get(symbol, 0)
+                    'score': _score_val,
+                    'stop_loss_price': _stop_px or None,
+                    'breakout_vol': _bvol,
                 })
-        
-        # 平掉不在做多列表中的多仓
-        for symbol in current_long:
-            if symbol not in long_symbols:
-                signals.append({
-                    'symbol': symbol,
-                    'type': 'close_long',
-                    'score': scores.get(symbol, 0)
-                })
-        
-        # 生成做空信号
+
+        # 多头持仓：只靠止损/量缩横盘平仓，不因排名下滑而平仓（与回测逻辑一致）
+
+        # 生成做空信号（当前策略为纯多头，short_symbols 为空，此块保留兼容性）
         for symbol in short_symbols:
             if symbol not in current_short:
-                # 如果当前没有空仓，开空
                 if symbol in current_long:
-                    # 如果当前是多仓，先平多再开空
                     signals.append({
                         'symbol': symbol,
                         'type': 'close_long',
@@ -4291,20 +4640,208 @@ class TradingExecutor:
                 signals.append({
                     'symbol': symbol,
                     'type': 'open_short',
-                    'score': scores.get(symbol, 0)
+                    'score': scores.get(symbol, 0),
+                    'stop_loss_price': _stop_prices.get(symbol),
                 })
-        
-        # 平掉不在做空列表中的空仓
-        for symbol in current_short:
-            if symbol not in short_symbols:
-                signals.append({
-                    'symbol': symbol,
-                    'type': 'close_short',
-                    'score': scores.get(symbol, 0)
-                })
-        
+
+        # 空头持仓：只靠止损平仓，不因排名下滑而平仓
+
         return signals
     
+    # Per-strategy stop dedup: symbol → last-fired epoch seconds
+    _cs_intraday_stop_fired: Dict[str, Dict[str, float]] = {}
+
+    @staticmethod
+    def _trail_stop_mult(level: int) -> float:
+        if level == 1: return 1.0   # 保本
+        if level == 2: return 1.2   # 锁利20%
+        if level == 3: return 1.5   # 锁利50%
+        return float(level - 2)     # level4→×2.0, level5→×3.0 …
+
+    @staticmethod
+    def _trail_lock_label(level: int) -> str:
+        if level == 1: return "保本"
+        if level == 2: return "锁利20%"
+        if level == 3: return "锁利50%"
+        return f"锁利{(level - 2) * 100}%"
+
+    def _check_cs_intraday_stop_loss(
+        self,
+        strategy_id: int,
+        trading_config: Dict[str, Any],
+        strategy_name: str,
+        execution_mode: str,
+        market_type: str,
+        market_category: str,
+        leverage: float,
+        initial_capital: float,
+        notification_config: Dict[str, Any],
+        ai_model_config: Dict[str, Any],
+    ) -> None:
+        """
+        截面策略盘中实时止损检查（每 tick 执行，不等调仓）。
+
+        读取 qd_strategy_positions 里的 stop_loss_price / trail_level，
+        拉实时价，价格穿透有效止损价时立即发平仓信号。
+        通过 pending_orders 去重：同标的已有 pending/processing 的 close 单时跳过。
+        """
+        try:
+            positions = self._get_all_positions(strategy_id)
+            if not positions:
+                return
+
+            breakeven_trigger = float(trading_config.get('breakeven_trigger_pct', 10)) / 100
+            sid_key = str(strategy_id)
+            if sid_key not in self._cs_intraday_stop_fired:
+                self._cs_intraday_stop_fired[sid_key] = {}
+            fired_map = self._cs_intraday_stop_fired[sid_key]
+
+            for pos in positions:
+                sym = pos.get('symbol', '')
+                side = (pos.get('side') or '').strip().lower()
+                if side not in ('long', 'short'):
+                    continue
+
+                struct_stop = float(pos.get('stop_loss_price') or 0)
+                entry_px = float(pos.get('entry_price') or 0)
+                if struct_stop <= 0 or entry_px <= 0:
+                    continue
+
+                # Fetch real-time price
+                try:
+                    px = self._fetch_current_price(
+                        None, sym, market_type=market_type, market_category=market_category
+                    )
+                    cur_px = float(px) if px else 0.0
+                except Exception:
+                    cur_px = 0.0
+                if cur_px <= 0:
+                    continue
+
+                # Update current_price in DB (best-effort)
+                try:
+                    with get_db_connection() as _db:
+                        _c = _db.cursor()
+                        _c.execute(
+                            "UPDATE qd_strategy_positions SET current_price = %s "
+                            "WHERE strategy_id = %s AND symbol = %s AND side = %s",
+                            (cur_px, strategy_id, sym, side),
+                        )
+                        _db.commit()
+                        _c.close()
+                except Exception:
+                    pass
+
+                # Compute trail level (升不降)
+                trail_level = int(pos.get('trail_level') or 0)
+                float_pct = (cur_px / entry_px - 1) * 100 if entry_px > 0 else 0
+                if side == 'long':
+                    if float_pct >= 300:
+                        new_level = int(float_pct // 100) + 2
+                    elif float_pct >= 200:
+                        new_level = 4
+                    elif float_pct >= 100:
+                        new_level = 3
+                    elif float_pct >= 50:
+                        new_level = 2
+                    elif float_pct >= breakeven_trigger * 100:
+                        new_level = 1
+                    else:
+                        new_level = 0
+                    now_level = max(trail_level, new_level)
+                    if now_level > trail_level:
+                        try:
+                            with get_db_connection() as _db:
+                                _c = _db.cursor()
+                                _c.execute(
+                                    "UPDATE qd_strategy_positions SET trail_level = %s, breakeven_activated = TRUE "
+                                    "WHERE strategy_id = %s AND symbol = %s AND side = %s",
+                                    (now_level, strategy_id, sym, side),
+                                )
+                                _db.commit()
+                                _c.close()
+                        except Exception:
+                            pass
+                    if now_level > 0:
+                        effective_stop = max(struct_stop, entry_px * self._trail_stop_mult(now_level))
+                    else:
+                        effective_stop = struct_stop
+                    triggered = cur_px < effective_stop
+                else:
+                    now_level = max(trail_level, 1 if (entry_px > 0 and cur_px <= entry_px * (1 - breakeven_trigger)) else 0)
+                    effective_stop = min(struct_stop, entry_px) if now_level > 0 else struct_stop
+                    triggered = cur_px > effective_stop
+
+                if not triggered:
+                    # Clear dedup entry once price is safely above stop
+                    fired_map.pop(sym, None)
+                    continue
+
+                # Dedup: skip if already fired within the last 300 s
+                last_fired = fired_map.get(sym, 0)
+                if time.time() - last_fired < 300:
+                    continue
+
+                # Dedup: skip if there's already a pending/processing close order
+                try:
+                    with get_db_connection() as _db:
+                        _c = _db.cursor()
+                        _c.execute(
+                            "SELECT COUNT(*) AS cnt FROM pending_orders "
+                            "WHERE strategy_id = %s AND symbol = %s "
+                            "AND signal_type IN ('close_long', 'close_short') "
+                            "AND status IN ('pending', 'processing')",
+                            (strategy_id, sym),
+                        )
+                        row = _c.fetchone() or {}
+                        _c.close()
+                        if int(row.get('cnt') or 0) > 0:
+                            continue
+                except Exception:
+                    pass
+
+                label = self._trail_lock_label(now_level) if now_level > 0 else "结构止损"
+                close_type = 'close_long' if side == 'long' else 'close_short'
+                logger.info(
+                    f"[盘中止损] strategy={strategy_id} {sym} side={side} "
+                    f"cur={cur_px:.6f} stop={effective_stop:.6f} entry={entry_px:.6f} [{label}]"
+                )
+                append_strategy_log(
+                    strategy_id, "warn",
+                    f"盘中止损触发 {sym} [{label}]: 当前={cur_px:.6f} 止损={effective_stop:.6f} 开仓={entry_px:.6f}",
+                )
+                fired_map[sym] = time.time()
+
+                try:
+                    self._execute_signal(
+                        strategy_id=strategy_id,
+                        strategy_name=strategy_name,
+                        exchange=None,
+                        symbol=sym,
+                        current_price=cur_px,
+                        signal_type=close_type,
+                        position_size=None,
+                        current_positions=[pos],
+                        trade_direction='both',
+                        leverage=leverage,
+                        initial_capital=initial_capital,
+                        market_type=market_type,
+                        market_category=market_category,
+                        margin_mode='cross',
+                        stop_loss_price=None,
+                        take_profit_price=None,
+                        execution_mode=execution_mode,
+                        notification_config=notification_config,
+                        trading_config=trading_config,
+                        ai_model_config=ai_model_config,
+                        signal_ts=int(time.time()),
+                    )
+                except Exception as exc:
+                    logger.error(f"[盘中止损] _execute_signal failed for {sym}: {exc}")
+
+        except Exception as e:
+            logger.warning(f"_check_cs_intraday_stop_loss strategy={strategy_id} error: {e}")
+
     def _run_cross_sectional_strategy_loop(
         self,
         strategy_id: int,
@@ -4368,12 +4905,30 @@ class TradingExecutor:
                         continue
                 last_tick_time = current_time
                 
+                # 盘中实时止损检查（每 tick 执行，不依赖调仓）
+                self._check_cs_intraday_stop_loss(
+                    strategy_id=strategy_id,
+                    trading_config=trading_config,
+                    strategy_name=strategy_name,
+                    execution_mode=execution_mode,
+                    market_type=market_type,
+                    market_category=market_category,
+                    leverage=leverage,
+                    initial_capital=initial_capital,
+                    notification_config=notification_config,
+                    ai_model_config=ai_model_config,
+                )
+
+                # 按需自动刷新标的列表（由 symbol_refresh_days 控制，0=不刷新）
+                # 放在调仓检查之前：刷新只更新列表，等下次正常调仓时间才使用新列表
+                symbol_list = self._refresh_symbol_list_if_needed(strategy_id, trading_config, symbol_list)
+
                 # 检查是否需要调仓
-                if not self._should_rebalance(strategy_id, rebalance_frequency):
+                if not self._should_rebalance(strategy_id, rebalance_frequency, trading_config):
                     continue
-                
+
                 logger.info(f"Cross-sectional strategy {strategy_id} rebalancing...")
-                
+
                 # 执行截面指标
                 result = self._execute_cross_sectional_indicator(
                     indicator_code, symbol_list, trading_config, market_category, timeframe,
@@ -4386,7 +4941,10 @@ class TradingExecutor:
                 
                 # 生成信号
                 signals = self._generate_cross_sectional_signals(
-                    strategy_id, result['rankings'], result['scores'], trading_config
+                    strategy_id, result['rankings'], result['scores'], trading_config,
+                    stop_prices=result.get('stop_prices', {}),
+                    all_data=result.get('all_data', {}),
+                    signal_types=result.get('signal_types', {}),
                 )
                 
                 if not signals:
@@ -4395,19 +4953,29 @@ class TradingExecutor:
                     continue
                 
                 logger.info(f"Generated {len(signals)} signals for cross-sectional strategy {strategy_id}")
-                
+
                 # 批量执行交易
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 with ThreadPoolExecutor(max_workers=min(10, len(signals))) as executor:
                     futures = {}
                     for signal in signals:
+                        # signal['symbol'] 已在 _generate_cross_sectional_signals 归一化为 raw symbol
+                        raw_sym = signal['symbol']
+                        # 获取当前价格，避免 _execute_signal 内部除以 0
+                        try:
+                            price_info = self._fetch_current_price(
+                                None, raw_sym, market_type=market_type, market_category=market_category
+                            )
+                            exec_price = float(price_info) if price_info else 0.0
+                        except Exception:
+                            exec_price = 0.0
                         future = executor.submit(
                             self._execute_signal,
                             strategy_id=strategy_id,
                             strategy_name=strategy_name,
                             exchange=None,  # Signal mode
-                            symbol=signal['symbol'],
-                            current_price=0.0,  # Will be fetched in _execute_signal
+                            symbol=raw_sym,
+                            current_price=exec_price,
                             signal_type=signal['type'],
                             position_size=None,
                             current_positions=[],
@@ -4417,7 +4985,7 @@ class TradingExecutor:
                             market_type=market_type,
                             market_category=market_category,
                             margin_mode='cross',
-                            stop_loss_price=None,
+                            stop_loss_price=signal.get('stop_loss_price'),
                             take_profit_price=None,
                             execution_mode=execution_mode,
                             notification_config=notification_config,
@@ -4436,7 +5004,26 @@ class TradingExecutor:
                                 logger.info(f"Successfully executed signal: {signal['symbol']} {signal['type']}")
                         except Exception as e:
                             logger.error(f"Failed to execute signal {signal['symbol']} {signal['type']}: {e}")
-                
+
+                # 开仓成交后补写 breakout_vol
+                for signal in signals:
+                    if signal.get('type') != 'open_long':
+                        continue
+                    bvol = float(signal.get('breakout_vol') or 0)
+                    if bvol <= 0:
+                        continue
+                    raw_sym = signal['symbol']  # 已在 _generate_cross_sectional_signals 归一化
+                    try:
+                        with get_db_connection() as _db:
+                            _c = _db.cursor()
+                            _c.execute(
+                                "UPDATE qd_strategy_positions SET breakout_vol = %s WHERE strategy_id = %s AND symbol = %s AND side = 'long' AND breakout_vol = 0",
+                                (bvol, strategy_id, raw_sym),
+                            )
+                            _db.commit()
+                            _c.close()
+                    except Exception as _e:
+                        logger.warning(f"Failed to persist breakout_vol for {raw_sym}: {_e}")
                 # 更新调仓时间
                 self._update_last_rebalance(strategy_id)
                 last_rebalance_time = current_time

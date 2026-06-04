@@ -2308,6 +2308,8 @@ class PendingOrderWorker:
                     signal_type=str(signal_type),
                     filled=filled,
                     avg_price=avg_price,
+                    stop_loss_price=float(payload.get("stop_loss_price") or 0.0) or None,
+                    breakout_vol=float(payload.get("breakout_vol") or 0.0) or None,
                 )
                 # ``profit`` = trade P&L from position math (gross).
                 # ``commission`` = fee synced from the exchange fill (see
@@ -2468,6 +2470,8 @@ class PendingOrderWorker:
                         signal_type=str(signal_type),
                         filled=filled,
                         avg_price=avg_price,
+                        stop_loss_price=float(payload.get("stop_loss_price") or 0.0) or None,
+                        breakout_vol=float(payload.get("breakout_vol") or 0.0) or None,
                     )
                     record_trade(
                         strategy_id=strategy_id,
@@ -2610,6 +2614,8 @@ class PendingOrderWorker:
                         signal_type=str(signal_type),
                         filled=filled,
                         avg_price=avg_price,
+                        stop_loss_price=float(payload.get("stop_loss_price") or 0.0) or None,
+                        breakout_vol=float(payload.get("breakout_vol") or 0.0) or None,
                     )
                     record_trade(
                         strategy_id=strategy_id,
@@ -2754,6 +2760,8 @@ class PendingOrderWorker:
                         signal_type=str(signal_type),
                         filled=filled,
                         avg_price=avg_price,
+                        stop_loss_price=float(payload.get("stop_loss_price") or 0.0) or None,
+                        breakout_vol=float(payload.get("breakout_vol") or 0.0) or None,
                     )
                     record_trade(
                         strategy_id=strategy_id,

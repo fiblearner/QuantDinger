@@ -136,6 +136,18 @@ def _fetch_position(strategy_id: int, symbol: str, side: str) -> Dict[str, Any]:
     return row if isinstance(row, dict) else {}
 
 
+def mark_breakeven_activated(strategy_id: int, symbol: str, side: str) -> None:
+    """一旦浮盈达到保本触发线，将该持仓的 breakeven_activated 标记为 True（不可逆）。"""
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            "UPDATE qd_strategy_positions SET breakeven_activated = TRUE WHERE strategy_id = %s AND symbol = %s AND side = %s",
+            (int(strategy_id), str(symbol), str(side)),
+        )
+        db.commit()
+        cur.close()
+
+
 def _delete_position(strategy_id: int, symbol: str, side: str) -> None:
     with get_db_connection() as db:
         cur = db.cursor()
@@ -158,6 +170,9 @@ def upsert_position(
     highest_price: float = 0.0,
     lowest_price: float = 0.0,
     user_id: int = None,
+    stop_loss_price: float = None,
+    breakout_vol: float = None,
+    sl_order_id: str = None,
 ) -> None:
     if user_id is None:
         user_id = _get_user_id_from_strategy(strategy_id)
@@ -166,21 +181,59 @@ def upsert_position(
         cur.execute(
             """
             INSERT INTO qd_strategy_positions
-            (user_id, strategy_id, symbol, side, size, entry_price, current_price, highest_price, lowest_price, updated_at)
+            (user_id, strategy_id, symbol, side, size, entry_price, current_price, highest_price, lowest_price,
+             stop_loss_price, breakout_vol, sl_order_id, updated_at)
             VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT(strategy_id, symbol, side) DO UPDATE SET
                 size = excluded.size,
                 entry_price = excluded.entry_price,
                 current_price = excluded.current_price,
                 highest_price = CASE WHEN excluded.highest_price > 0 THEN excluded.highest_price ELSE qd_strategy_positions.highest_price END,
                 lowest_price = CASE WHEN excluded.lowest_price > 0 THEN excluded.lowest_price ELSE qd_strategy_positions.lowest_price END,
+                stop_loss_price = CASE WHEN excluded.stop_loss_price > 0 THEN excluded.stop_loss_price ELSE qd_strategy_positions.stop_loss_price END,
+                breakout_vol = CASE WHEN excluded.breakout_vol > 0 THEN excluded.breakout_vol ELSE qd_strategy_positions.breakout_vol END,
+                sl_order_id = CASE WHEN excluded.sl_order_id IS NOT NULL AND excluded.sl_order_id <> '' THEN excluded.sl_order_id ELSE qd_strategy_positions.sl_order_id END,
                 updated_at = NOW()
             """,
-            (int(user_id), int(strategy_id), str(symbol), str(side), float(size or 0.0), float(entry_price or 0.0), float(current_price or 0.0), float(highest_price or 0.0), float(lowest_price or 0.0)),
+            (
+                int(user_id), int(strategy_id), str(symbol), str(side),
+                float(size or 0.0), float(entry_price or 0.0), float(current_price or 0.0),
+                float(highest_price or 0.0), float(lowest_price or 0.0),
+                float(stop_loss_price or 0.0), float(breakout_vol or 0.0),
+                str(sl_order_id or ""),
+            ),
         )
         db.commit()
         cur.close()
+
+
+def update_sl_order_id(*, strategy_id: int, symbol: str, side: str, sl_order_id: str) -> None:
+    """开仓后记录交易所止损单 ID，或止损单更新后刷新。"""
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            "UPDATE qd_strategy_positions SET sl_order_id = %s WHERE strategy_id = %s AND symbol = %s AND side = %s",
+            (str(sl_order_id or ""), int(strategy_id), str(symbol), str(side)),
+        )
+        db.commit()
+        cur.close()
+
+
+def get_sl_order_id(*, strategy_id: int, symbol: str, side: str) -> str:
+    """读取持仓的交易所止损单 ID。"""
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT sl_order_id FROM qd_strategy_positions WHERE strategy_id = %s AND symbol = %s AND side = %s",
+                (int(strategy_id), str(symbol), str(side)),
+            )
+            row = cur.fetchone()
+            cur.close()
+            return str((row or {}).get("sl_order_id") or "")
+    except Exception:
+        return ""
 
 
 def apply_fill_to_local_position(
@@ -190,6 +243,8 @@ def apply_fill_to_local_position(
     signal_type: str,
     filled: float,
     avg_price: float,
+    stop_loss_price: float = None,
+    breakout_vol: float = None,
 ) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
     """
     Apply a fill to the local position snapshot.
@@ -243,6 +298,8 @@ def apply_fill_to_local_position(
             current_price=px,
             highest_price=new_high,
             lowest_price=new_low,
+            stop_loss_price=stop_loss_price,
+            breakout_vol=breakout_vol,
         )
         return None, _fetch_position(sid, sym_key, side)
 

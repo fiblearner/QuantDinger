@@ -342,6 +342,11 @@ CREATE TABLE IF NOT EXISTS qd_strategy_positions (
     unrealized_pnl DECIMAL(20,8) DEFAULT 0,
     pnl_percent DECIMAL(10,4) DEFAULT 0,
     equity DECIMAL(20,8) DEFAULT 0,
+    stop_loss_price DECIMAL(20,8) DEFAULT 0,
+    trail_level INTEGER DEFAULT 0,
+    breakout_vol DECIMAL(20,8) DEFAULT 0,
+    breakeven_activated BOOLEAN DEFAULT FALSE,
+    breakeven_price DECIMAL(20,8) DEFAULT 0,
     updated_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(strategy_id, symbol, side)
 );

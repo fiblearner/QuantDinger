@@ -996,6 +996,59 @@ class BinanceFuturesClient(BaseRestClient):
             raise LiveTradingError("Binance cancel_order requires order_id or client_order_id")
         return self._signed_request("DELETE", "/fapi/v1/order", params=params)
 
+    def place_stop_market_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: float,
+        stop_price: float,
+        position_side: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        挂 STOP_MARKET 止损单（减仓，交易所侧执行）。
+
+        side: 'SELL'（多头止损）或 'BUY'（空头止损）
+        stop_price: 触发价格
+        返回原始 Binance 响应（含 orderId）
+        """
+        sym = to_binance_futures_symbol(symbol)
+        sd = (side or "").upper()
+        if sd not in ("BUY", "SELL"):
+            raise LiveTradingError(f"Invalid side: {side}")
+
+        q_dec, qty_precision = self._normalize_quantity(symbol=symbol, quantity=float(quantity or 0), for_market=True)
+        if float(q_dec or 0) <= 0:
+            raise LiveTradingError(f"place_stop_market_order: invalid quantity {quantity}")
+
+        stop_dec = self._normalize_price(symbol=symbol, price=float(stop_price))
+
+        params: Dict[str, Any] = {
+            "symbol": sym,
+            "side": sd,
+            "type": "STOP_MARKET",
+            "quantity": self._dec_str(q_dec, strict_precision=qty_precision),
+            "stopPrice": self._dec_str(stop_dec),
+            "reduceOnly": "true",
+        }
+
+        client_order_id_norm = self._format_client_order_id(client_order_id)
+        if client_order_id_norm:
+            params["newClientOrderId"] = client_order_id_norm
+
+        dual_side = self.get_dual_side_position()
+        pos_norm = self._normalize_position_side(position_side)
+        if dual_side is True:
+            ps = pos_norm if pos_norm in ("LONG", "SHORT") else self._infer_position_side(side=sd, reduce_only=True)
+            params["positionSide"] = ps
+            # reduceOnly is incompatible with explicit positionSide in hedge mode
+            params.pop("reduceOnly", None)
+        elif dual_side is False:
+            params.pop("positionSide", None)
+
+        return self._signed_request("POST", "/fapi/v1/order", params=params)
+
     def set_margin_type(self, *, symbol: str, margin_mode: str) -> Dict[str, Any]:
         """
         Set symbol margin mode on USDT-M futures.
