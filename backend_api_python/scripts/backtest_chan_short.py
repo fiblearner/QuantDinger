@@ -1,13 +1,22 @@
 """
-backtest_chan.py
-2026-01-01 ~ 今日  缠论截面策略逐日回测（仅做多）
+backtest_chan_short.py
+2026-01-01 ~ 今日  缠论截面策略逐日回测（仅做空）
 
-优先读取 kline_cache/ 本地缓存，缓存不存在时才从 API 拉取。
-先运行 cache_klines.py 初始化缓存可大幅加速。
+空头信号：
+  二类卖点（2s）- 中枢后反弹未过顶，再度下行
+  三类卖点（3s）- 跌破中枢后反弹未回，站稳下方
+
+开仓过滤：
+  1. 收盘价须在 60 日均线以下（趋势向下）
+  2. 量能过滤：量能萎缩时须放量才允许入场
+  3. 止损位必须在当前价上方
+
+止损：结构高点上方 2%，阶梯移动保本/锁利
+出场：止损 / 量缩横盘（量缩+价格未有效下行）
 
 用法:
-  docker exec quantdinger-backend python scripts/backtest_chan.py
-  本地: PROXY_URL=http://127.0.0.1:7890 python scripts/backtest_chan.py
+  docker exec quantdinger-backend python scripts/backtest_chan_short.py
+  本地: PROXY_URL=http://127.0.0.1:7890 python scripts/backtest_chan_short.py
 
 环境变量:
   NO_FETCH=1   只用本地缓存，缺失标的直接跳过（离线模式）
@@ -39,30 +48,29 @@ SIM_START       = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SIM_END         = datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 WARMUP_DAYS     = 60          # SIM_START 前 60 天起拉数据作为暖机
 TIMEFRAME       = "4h"
-# 调仓时间（北京时间 CST=UTC+8），支持多个时间点，回测按对应 UTC 时刻切片
 REBALANCE_HOURS_UTC = [16, 4]   # 00:05 CST=16:05 UTC, 12:05 CST=04:05 UTC
 PORTFOLIO_SIZE  = 5
 INITIAL_CAPITAL = 10_000.0
 LEVERAGE        = 2
 ENTRY_PCT       = 0.20
 MIN_HOLD_HOURS  = 72
-BREAKEVEN_PCT   = 0.10        # 浮盈 10% 后止损上移至成本
-STOP_BUFFER     = 0.98        # 止损缓冲 2%（结构低点下方）
+BREAKEVEN_PCT   = 0.10        # 浮盈 10% 后止损下移至成本
+STOP_MULT       = 1.02        # 止损缓冲：结构高点上方 2%
 MAX_SYMBOLS     = 100
 COOLDOWN_DAYS   = 5           # 止损/量缩平仓后同标的冷却天数
 
-# 信号阈值（与生产一致，仅二买/三买）
-THRESHOLD_2B    = 60          # 二类买点入选分
-THRESHOLD_3B    = 60          # 三类买点入选分
+# 信号阈值（仅二卖/三卖）
+THRESHOLD_2S    = 60          # 二类卖点入选分
+THRESHOLD_3S    = 60          # 三类卖点入选分
 
 # 趋势过滤
 TREND_MA_BARS   = 240         # 60 日均线（4H × 240 根）
 
-# 量缩横盘出场
-VOL_CONSOL_DAYS   = 7         # 观察窗口（天）→ 42 根 4H
-VOL_CONSOL_PCT    = 0.08      # 近期高点未超过入场价 +8% 视为横盘
+# 量缩横盘出场（空头：未有效下跌 + 量缩 → 动能丧失）
+VOL_CONSOL_DAYS   = 7
+VOL_CONSOL_PCT    = 0.08      # 近期低点未跌超入场价 -8% 视为横盘
 VOL_SHRINK_RATIO  = 0.60      # 近期均量 < 突破量 × 60% 视为量缩
-VOL_MIN_HOLD_DAYS = 3         # 持仓至少 N 天后才检查量缩
+VOL_MIN_HOLD_DAYS = 3
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -120,7 +128,7 @@ def fetch_ohlcv_full(exchange: ccxt.Exchange, symbol: str,
 
 def load_symbol_data(exchange, symbol: str,
                      since_dt: datetime, end_dt: datetime) -> pd.DataFrame:
-    cached  = load_cache(symbol)
+    cached   = load_cache(symbol)
     since_ms = int(since_dt.timestamp() * 1000)
     end_ms   = int(end_dt.timestamp() * 1000)
 
@@ -174,7 +182,7 @@ def load_symbol_data(exchange, symbol: str,
     return df
 
 
-# ── 缠论核心函数 ──────────────────────────────────────────────────────────────
+# ── 缠论核心函数（与多头版一致）──────────────────────────────────────────────
 
 def merge_inclusion(highs, lows):
     ph, pl = list(highs), list(lows)
@@ -249,7 +257,7 @@ def find_zhongshu(bi_list):
 
 
 def _volume_breakout_ok(vol: pd.Series) -> bool:
-    """量能萎缩时要求放量，正常量能直接放行。与生产逻辑一致：近14根/近90根均量。"""
+    """量能萎缩时要求放量，正常量能直接放行（与多头版一致）。"""
     if len(vol) < 90:
         return True
     v14 = float(vol.tail(14).mean())
@@ -264,10 +272,13 @@ def _volume_breakout_ok(vol: pd.Series) -> bool:
     return False
 
 
-def score_symbol(df: pd.DataFrame) -> Tuple[float, float, str]:
-    """返回 (score, stop_price, signal_type)，仅输出多头信号（≥0）。
-    signal_type: '2b'=二买  '3b'=三买  ''=无信号
-    （一类买点已移除，与生产保持一致）
+# ── 空头专用函数 ──────────────────────────────────────────────────────────────
+
+def score_symbol_short(df: pd.DataFrame) -> Tuple[float, float, str]:
+    """
+    返回 (score, stop_price, signal_type)，仅输出空头信号。
+    signal_type: '2s'=二卖  '3s'=三卖  ''=无信号
+    stop_price: 止损位，在入场价上方（空头止损方向）
     """
     if len(df) < 80:
         return 0.0, 0.0, ''
@@ -295,79 +306,90 @@ def score_symbol(df: pd.DataFrame) -> Tuple[float, float, str]:
     stop  = 0.0
     signal_type = ''
 
-    # ── 二类买点 ──────────────────────────────────────────────────────────────
+    # ── 二类卖点：中枢后反弹未过ZG，再度下行 ──────────────────────────────
     if zs_list and len(bi_list) >= 3:
         lz   = zs_list[-1]
         post = bi_list[lz['end_bi']+1:]
         if post:
             lp_ = post[-1]
-            if lp_['dir'] == 1:
-                bot = lp_['start'][1]
-                if bot > lz['ZD']:
-                    dist = (cur - bot) / (bot + 1e-9)
+            if lp_['dir'] == -1:               # 最后一笔向下（空头方向）
+                top = lp_['start'][1]           # 这笔下跌的起点（反弹顶）
+                if top < lz['ZG']:              # 顶部未过中枢顶
+                    dist = (top - cur) / (top + 1e-9)   # 当前价距顶部（0=在顶, 正=已跌）
                     if 0 <= dist < 0.12:
                         s2 = 75 * (1 - dist / 0.12)
                         if s2 > score:
-                            score, stop, signal_type = s2, round(lz['ZD'] * STOP_BUFFER, 8), '2b'
+                            score = s2
+                            stop  = round(lz['ZG'] * STOP_MULT, 8)
+                            signal_type = '2s'
 
-    # ── 三类买点 ──────────────────────────────────────────────────────────────
+    # ── 三类卖点：跌破中枢后反弹未回ZD ────────────────────────────────────
     if zs_list and len(bi_list) >= 5:
         lz   = zs_list[-1]
         post = bi_list[lz['end_bi']+1:]
         if len(post) >= 2:
             brk, pb = post[0], post[1]
-            if brk['dir'] == 1 and brk['end'][1] > lz['ZG']:
-                if pb['dir'] == -1:
-                    pbot = pb['end'][1]
-                    if pbot > lz['ZG']:
-                        dist = (cur - pbot) / (pbot + 1e-9)
+            if brk['dir'] == -1 and brk['end'][1] < lz['ZD']:   # 向下突破中枢
+                if pb['dir'] == 1:                                 # 反弹笔
+                    ptop = pb['end'][1]                            # 反弹顶
+                    if ptop < lz['ZD']:                            # 未回中枢
+                        dist = (ptop - cur) / (ptop + 1e-9)
                         if 0 <= dist < 0.08:
                             s3 = 65 * (1 - dist / 0.08)
                             if s3 > score:
-                                score, stop, signal_type = s3, round(lz['ZG'] * STOP_BUFFER, 8), '3b'
+                                score = s3
+                                stop  = round(lz['ZD'] * STOP_MULT, 8)
+                                signal_type = '3s'
 
-    # ── RSI 加权（多头） ───────────────────────────────────────────────────────
+    # ── RSI 加权（空头：超买强化，超卖减弱）──────────────────────────────
     if score > 0:
-        if rsi_v < 35:
-            score = min(100, score * 1.25)
-        elif rsi_v > 70:
-            score *= 0.6
+        if rsi_v > 65:
+            score = min(100, score * 1.25)   # 超买区域 → 空头信号更强
+        elif rsi_v < 35:
+            score *= 0.6                     # 超卖区域 → 空头信号减弱
 
-    # ── 阈值过滤 ──────────────────────────────────────────────────────────────
-    thresholds = {'2b': THRESHOLD_2B, '3b': THRESHOLD_3B}
-    if score < thresholds.get(signal_type, THRESHOLD_2B):
+    # ── 阈值过滤 ──────────────────────────────────────────────────────────
+    thresholds = {'2s': THRESHOLD_2S, '3s': THRESHOLD_3S}
+    if score < thresholds.get(signal_type, THRESHOLD_2S):
         return 0.0, 0.0, ''
 
     return round(score, 2), stop, signal_type
 
 
-def _trail_stop_mult(level: int) -> float:
-    """与生产 trading_executor 保持一致的阶梯乘数。"""
-    if level == 1: return 1.0   # 保本
-    if level == 2: return 1.2   # 锁利20%
-    if level == 3: return 1.5   # 锁利50%
-    return float(level - 2)     # level4→×2.0, level5→×3.0
+def _short_trail_stop_mult(level: int) -> float:
+    """
+    空头阶梯止损乘数（止损位 = entry_px × mult，越低 = 锁利越多）。
+    level 0: 无阶梯，用结构止损
+    level 1: entry × 1.0  保本
+    level 2: entry × 0.80 锁利 20%
+    level 3: entry × 0.50 锁利 50%
+    level 4+: entry × max(0.10, 1 - level * 0.2)
+    """
+    if level == 1: return 1.0
+    if level == 2: return 0.80
+    if level == 3: return 0.50
+    return max(0.10, 1.0 - level * 0.20)
 
 
 # ── 回测主逻辑 ────────────────────────────────────────────────────────────────
 
-def _pos_pnl(pos: Dict, cur_px: float) -> Tuple[float, float]:
-    """返回 (pnl_pct, pnl_usd)。"""
+def _pos_pnl_short(pos: Dict, cur_px: float) -> Tuple[float, float]:
+    """返回 (pnl_pct, pnl_usd)，空头方向。"""
     entry_px = pos['entry_price']
-    pnl_pct  = (cur_px - entry_px) / entry_px * 100
+    pnl_pct  = (entry_px - cur_px) / entry_px * 100
     pnl_usd  = pnl_pct / 100 * (INITIAL_CAPITAL * ENTRY_PCT * LEVERAGE)
     return round(pnl_pct, 2), round(pnl_usd, 2)
 
 
-def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
-    # 生成调仓时间点列表：每天按 REBALANCE_HOURS_UTC 触发
+def run_backtest_short(symbol_map: Dict[str, pd.DataFrame]) -> None:
+    # 构建调仓时间点列表（每天 00:05 和 12:05 北京时间 → 16:05 UTC 和 04:05 UTC）
     rebalance_slots = []
-    d = SIM_START.replace(hour=0, minute=0, second=0, microsecond=0)
+    d = SIM_START
     while d <= SIM_END:
-        for h in sorted(REBALANCE_HOURS_UTC):
-            slot = d.replace(hour=h, minute=5)
-            if SIM_START <= slot <= SIM_END:
-                rebalance_slots.append(slot)
+        for h in REBALANCE_HOURS_UTC:
+            slot_candidate = d.replace(hour=h, minute=5, second=0, microsecond=0)
+            if SIM_START <= slot_candidate <= SIM_END:
+                rebalance_slots.append(slot_candidate)
         d += timedelta(days=1)
     rebalance_slots.sort()
 
@@ -378,12 +400,11 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
     trade_log: List[Dict] = []
 
     print(f"\n{'='*80}")
-    print(f"  缠论截面策略回测（仅做多 二买/三买）  {SIM_START.date()} → {SIM_END.date()}")
+    print(f"  缠论截面策略回测（仅做空 二卖/三卖）  {SIM_START.date()} → {SIM_END.date()}")
+    print(f"  调仓时间: 00:05, 12:05 (北京时间) 共 {len(rebalance_slots)} 个调仓点")
     print(f"  标的数: {len(symbol_map)}  组合上限: {PORTFOLIO_SIZE}  杠杆: {LEVERAGE}×")
     print(f"  单仓: {int(ENTRY_PCT*100)}%  最短持仓: {MIN_HOLD_HOURS}h  保本触发: {int(BREAKEVEN_PCT*100)}%")
-    print(f"  止损冷却: {COOLDOWN_DAYS}天  止损缓冲: {int((1-STOP_BUFFER)*100)}%")
-    cst_desc = ', '.join(f"{(h+8)%24:02d}:05" for h in sorted(REBALANCE_HOURS_UTC))
-    print(f"  调仓时间: {cst_desc} (北京时间)  共 {len(rebalance_slots)} 个调仓点")
+    print(f"  止损冷却: {COOLDOWN_DAYS}天  止损缓冲: {int((STOP_MULT-1)*100)}%（高点上方）")
     print(f"{'='*80}\n")
 
     def get_cur_px(sym: str) -> Optional[float]:
@@ -399,10 +420,9 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
     for slot in rebalance_slots:
         day_str = slot.strftime("%Y-%m-%d %H:%M")
 
-        # ── 清理过期冷却 ──────────────────────────────────────────────────────
         cooldown_until = {s: dt for s, dt in cooldown_until.items() if dt > slot}
 
-        # ── 评分所有标的 ──────────────────────────────────────────────────────
+        # ── 评分所有标的（空头信号）────────────────────────────────────────
         day_scores: Dict[str, float] = {}
         day_stops:  Dict[str, float] = {}
         day_types:  Dict[str, str]   = {}
@@ -412,7 +432,7 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             if len(slice_df) < 80:
                 continue
             try:
-                sc, st, stype = score_symbol(slice_df)
+                sc, st, stype = score_symbol_short(slice_df)
                 if sc > 0:
                     day_scores[sym] = sc
                     day_stops[sym]  = st
@@ -420,14 +440,13 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             except Exception:
                 pass
 
-        # 按评分从高到低排列（全为正分）
         ranking = sorted(day_scores.keys(), key=lambda s: day_scores[s], reverse=True)
 
-        # ── 1. 止损检查：逐根 4H K线模拟止损委托 ────────────────────────────
+        # ── 1. 止损检查（空头：cur > effective_stop 触发）────────────────
         for sym in list(positions.keys()):
             pos       = positions[sym]
             entry_px  = pos['entry_price']
-            struct_sl = pos['stop']
+            struct_sl = pos['stop']           # 止损位在入场价上方
             df_       = symbol_map.get(sym)
             if df_ is None:
                 continue
@@ -439,12 +458,12 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             eff_stop = struct_sl
             for _, bar in bars_today.iterrows():
                 bar_close = float(bar['close'])
-                bar_low   = float(bar['low'])
-                float_pct = (bar_close / entry_px - 1) * 100
+                bar_high  = float(bar['high'])
+                float_pct = (entry_px - bar_close) / entry_px * 100   # 空头浮盈
 
-                # 阶梯锁利：与生产一致，5档，只升不降
+                # 阶梯锁利（只升不降）
                 if float_pct >= 300:
-                    new_level = 5
+                    new_level = int(float_pct // 100) + 2
                 elif float_pct >= 200:
                     new_level = 4
                 elif float_pct >= 100:
@@ -460,11 +479,14 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
 
                 tl = pos['trail_level']
                 if tl > 0:
-                    eff = max(struct_sl, entry_px * _trail_stop_mult(tl))
+                    # 空头：有效止损 = min(结构止损, 入场价×乘数) → 价格越低锁利越多
+                    eff = min(struct_sl, entry_px * _short_trail_stop_mult(tl))
                 else:
                     eff = struct_sl
-                struct_hit = bar_low   < struct_sl
-                trail_hit  = tl > 0 and bar_close < entry_px * _trail_stop_mult(tl)
+
+                # 空头触发：价格升至止损位以上
+                struct_hit = bar_high   > struct_sl
+                trail_hit  = tl > 0 and bar_close > entry_px * _short_trail_stop_mult(tl)
                 if struct_hit or trail_hit:
                     hit_bar, eff_stop = bar, eff
                     break
@@ -472,10 +494,10 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             if hit_bar is None:
                 continue
 
-            pnl_pct, pnl_usd = _pos_pnl(pos, eff_stop)
+            pnl_pct, pnl_usd = _pos_pnl_short(pos, eff_stop)
             equity += pnl_usd
             tl = pos.get('trail_level', 0)
-            trail_tag = f" [锁利{(tl-1)*100}%]" if tl >= 2 else (" [保本]" if tl == 1 else "")
+            trail_tag = f" [锁利{(tl-1)*20}%]" if tl >= 2 else (" [保本]" if tl == 1 else "")
             trade_log.append({
                 'date': day_str, 'action': '止损平仓',
                 'symbol': sym, 'price': eff_stop, 'score': pos['score'],
@@ -486,8 +508,8 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             cooldown_until[sym] = slot + timedelta(days=COOLDOWN_DAYS)
             del positions[sym]
 
-        # ── 2. 量缩横盘出场（持仓 ≥ VOL_MIN_HOLD_DAYS 后检查）────────────────
-        consol_bars = VOL_CONSOL_DAYS * 6  # 7天 × 6根4H = 42根
+        # ── 2. 量缩横盘出场（空头：未有效下跌 + 量缩 → 动能丧失）────────
+        consol_bars = VOL_CONSOL_DAYS * 6
         for sym in list(positions.keys()):
             pos = positions[sym]
             held_days = (slot - pos['entry_time']).total_seconds() / 86400
@@ -502,17 +524,19 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             bars_since = df_[(df_['dt'] >= pos['entry_time']) & (df_['dt'] < slot)]
             if len(bars_since) < consol_bars:
                 continue
-            recent      = bars_since.tail(consol_bars)
-            recent_vol  = float(recent['volume'].astype(float).mean())
-            recent_high = float(recent['close'].astype(float).max())
+            recent     = bars_since.tail(consol_bars)
+            recent_vol = float(recent['volume'].astype(float).mean())
+            # 空头：关注最低价是否有效跌破（未跌表示横盘）
+            recent_low  = float(recent['close'].astype(float).min())
             entry_px    = pos['entry_price']
-            if not (recent_high <= entry_px * (1 + VOL_CONSOL_PCT) and
-                    recent_vol  <  breakout_vol * VOL_SHRINK_RATIO):
+            price_no_breakdown = recent_low >= entry_px * (1 - VOL_CONSOL_PCT)
+            vol_shrunk         = recent_vol  < breakout_vol * VOL_SHRINK_RATIO
+            if not (price_no_breakdown and vol_shrunk):
                 continue
             cur_px = get_cur_px(sym)
             if cur_px is None:
                 continue
-            pnl_pct, pnl_usd = _pos_pnl(pos, cur_px)
+            pnl_pct, pnl_usd = _pos_pnl_short(pos, cur_px)
             equity += pnl_usd
             trade_log.append({
                 'date': day_str, 'action': '量缩横盘平仓',
@@ -524,24 +548,22 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             cooldown_until[sym] = slot + timedelta(days=COOLDOWN_DAYS)
             del positions[sym]
 
-        # ── 3. 开仓：评分排名靠前、未持仓、未冷却、组合有空位 ────────────────
+        # ── 3. 开空仓：评分靠前、未持仓、未冷却、有空位 ────────────────
         for sym in ranking:
             if len(positions) >= PORTFOLIO_SIZE:
                 break
             if sym in positions or sym in cooldown_until:
                 continue
 
-            stype = day_types.get(sym, '')
-
-            # 个股趋势过滤：收盘价须在 60 日均线以上
+            # 个股趋势过滤：收盘价须在 60 日均线以下（做空）
             df_ = symbol_map.get(sym)
             if df_ is not None:
                 snap_close = df_[df_['dt'] < slot]['close'].astype(float)
                 if len(snap_close) >= TREND_MA_BARS:
-                    if float(snap_close.iloc[-1]) < float(snap_close.tail(TREND_MA_BARS).mean()):
+                    if float(snap_close.iloc[-1]) > float(snap_close.tail(TREND_MA_BARS).mean()):
                         continue
 
-            # 量能萎缩过滤
+            # 量能过滤
             if df_ is not None:
                 snap_vol = df_[df_['dt'] < slot]['volume'].astype(float).reset_index(drop=True)
                 if not _volume_breakout_ok(snap_vol):
@@ -552,8 +574,8 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
                 continue
 
             stop = day_stops.get(sym, 0)
-            # 止损方向校验：止损位必须在当前价下方
-            if stop > 0 and stop >= cur_px:
+            # 止损方向校验：空头止损须在当前价上方
+            if stop > 0 and stop <= cur_px:
                 continue
 
             bvol = float(df_[df_['dt'] < slot]['volume'].astype(float).tail(40).max()) \
@@ -561,17 +583,17 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             positions[sym] = {
                 'entry_price': cur_px, 'entry_time': slot,
                 'score': day_scores[sym], 'stop': stop,
-                'signal_type': stype, 'trail_level': 0,
+                'signal_type': day_types.get(sym, ''), 'trail_level': 0,
                 'breakout_vol': bvol,
             }
             trade_log.append({
-                'date': day_str, 'action': '开仓',
+                'date': day_str, 'action': '开空',
                 'symbol': sym, 'price': cur_px, 'score': day_scores[sym],
                 'stop': stop, 'pnl%': 0, 'pnl$': 0, 'hold_h': 0,
-                'reason': f"{stype} score={day_scores[sym]}",
+                'reason': f"{day_types.get(sym, '')} score={day_scores[sym]}",
             })
 
-        # ── 打印有操作的时间点 ────────────────────────────────────────────────
+        # ── 打印有操作的时间点 ────────────────────────────────────────────
         day_trades = [t for t in trade_log if t['date'] == day_str]
         if day_trades:
             cd_list = list(cooldown_until.keys())
@@ -580,8 +602,8 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
                   f"  净值: ${equity:,.2f}"
                   + (f"  冷却: {cd_list}" if cd_list else ""))
             for t in day_trades:
-                if t['action'] == '开仓':
-                    print(f"    ▶ 开多 {t['symbol']:<20} @{t['price']:.6g}"
+                if t['action'] == '开空':
+                    print(f"    ▼ 开空 {t['symbol']:<20} @{t['price']:.6g}"
                           f"  score={t['score']:>+8.2f}  止损={t['stop']:.6g}")
                 elif t['action'] == '止损平仓':
                     print(f"    ✕ 止损 {t['symbol']:<20} @{t['price']:.6g}"
@@ -604,10 +626,10 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             continue
         cur_px = float(df_.iloc[-1]['close'])
         held_h = (SIM_END - pos['entry_time']).total_seconds() / 3600
-        pnl_pct, pnl_usd = _pos_pnl(pos, cur_px)
+        pnl_pct, pnl_usd = _pos_pnl_short(pos, cur_px)
         equity += pnl_usd
         sign = "+" if pnl_pct >= 0 else ""
-        print(f"    多 {sym:<20} @{cur_px:.6g}  持仓={held_h:.0f}h  "
+        print(f"    空 {sym:<20} @{cur_px:.6g}  持仓={held_h:.0f}h  "
               f"{sign}{pnl_pct:.2f}%  ({sign}${pnl_usd:.2f})")
         trade_log.append({
             'date': SIM_END.strftime("%Y-%m-%d"), 'action': '模拟结束平仓',
@@ -621,8 +643,8 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
     print(f"  回测汇总  {SIM_START.date()} → {SIM_END.date()}")
     print(f"{'='*80}")
 
-    all_closed = [t for t in trade_log if t['action'] != '开仓']
-    opens      = [t for t in trade_log if t['action'] == '开仓']
+    all_closed = [t for t in trade_log if t['action'] != '开空']
+    opens      = [t for t in trade_log if t['action'] == '开空']
     stops_l    = [t for t in trade_log if t['action'] == '止损平仓']
     consol_l   = [t for t in trade_log if t['action'] == '量缩横盘平仓']
     wins       = [t for t in all_closed if t['pnl%'] > 0]
@@ -630,7 +652,7 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
     total_pnl  = sum(t['pnl$'] for t in all_closed)
     win_rate   = len(wins) / len(all_closed) * 100 if all_closed else 0
 
-    print(f"  开仓次数     : {len(opens)}")
+    print(f"  开空次数     : {len(opens)}")
     print(f"  止损平仓     : {len(stops_l)}")
     print(f"  量缩横盘平仓 : {len(consol_l)}")
     print(f"  盈利次数     : {len(wins)}  亏损次数: {len(loses)}")
@@ -653,7 +675,7 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
               f"{t['stop']:>12.6g} {t['hold_h']:>7.1f} "
               f"{sign+str(t['pnl%'])+'%':>8} {('+' if t['pnl$']>=0 else '')+str(t['pnl$']):>9}")
 
-    out = os.path.join(os.path.dirname(__file__), "backtest_result.json")
+    out = os.path.join(os.path.dirname(__file__), "backtest_result_short.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump({
             "summary": {
@@ -703,7 +725,7 @@ def main():
             print("数据不足，跳过")
 
     print(f"\n[INFO] 有效标的: {len(symbol_map)} 个，开始回测...\n")
-    run_backtest(symbol_map)
+    run_backtest_short(symbol_map)
 
 
 if __name__ == "__main__":

@@ -4130,35 +4130,42 @@ class TradingExecutor:
                 if isinstance(last_rebalance, str):
                     last_rebalance = datetime.fromisoformat(last_rebalance.replace('Z', '+00:00'))
 
-            rebalance_time = (trading_config or {}).get('rebalance_time', '').strip()  # e.g. "00:05"
+            rebalance_time = (trading_config or {}).get('rebalance_time', '').strip()  # e.g. "00:05" or "00:05,12:05"
             if rebalance_time:
                 import pytz
                 cst = pytz.timezone('Asia/Shanghai')
                 now_cst = datetime.now(cst)
-                try:
-                    hh, mm = [int(x) for x in rebalance_time.split(':')]
-                except ValueError:
-                    logger.warning(f"Invalid rebalance_time format: {rebalance_time!r}, expected HH:MM")
-                    hh, mm = 0, 5
 
-                # 判断当前时刻是否在目标窗口内（±5分钟），且今天还未调仓
-                target = now_cst.replace(hour=hh, minute=mm, second=0, microsecond=0)
-                in_window = abs((now_cst - target).total_seconds()) <= 300
+                # 支持逗号分隔的多时间点，如 "00:05,12:05"
+                time_slots = [t.strip() for t in rebalance_time.split(',') if t.strip()]
 
-                if not in_window:
-                    return False
+                for slot in time_slots:
+                    try:
+                        hh, mm = [int(x) for x in slot.split(':')]
+                    except ValueError:
+                        logger.warning(f"Invalid rebalance_time slot: {slot!r}, expected HH:MM")
+                        continue
 
-                if last_rebalance is None:
-                    return True
+                    # 判断当前时刻是否在目标窗口内（±5分钟）
+                    target = now_cst.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    in_window = abs((now_cst - target).total_seconds()) <= 300
+                    if not in_window:
+                        continue
 
-                # last_rebalance 可能是 naive（DB 存的是 server local time）
-                if last_rebalance.tzinfo is None:
-                    last_rebalance_cst = cst.localize(last_rebalance)
-                else:
-                    last_rebalance_cst = last_rebalance.astimezone(cst)
+                    # 在窗口内 → 检查是否已在本窗口内调过仓
+                    if last_rebalance is None:
+                        return True
 
-                # 今天已经调仓过了就跳过
-                return last_rebalance_cst.date() < now_cst.date()
+                    if last_rebalance.tzinfo is None:
+                        last_rebalance_cst = cst.localize(last_rebalance)
+                    else:
+                        last_rebalance_cst = last_rebalance.astimezone(cst)
+
+                    # 上次调仓时间早于本窗口起点则允许触发
+                    window_start = target - timedelta(minutes=5)
+                    return last_rebalance_cst < window_start
+
+                return False
 
             # ── 原有间隔触发逻辑 ──────────────────────────────────────────
             if last_rebalance is None:
@@ -4214,6 +4221,13 @@ class TradingExecutor:
             logger.info("Fetching 24h tickers from Binance for symbol list refresh...")
             tickers = exchange.fetch_tickers()
 
+            # 加载 markets 以过滤 TRADIFI_PERPETUAL（股票型永续合约）
+            try:
+                markets = exchange.load_markets()
+            except Exception:
+                markets = {}
+            EXCLUDE_CONTRACT_TYPES = {"TRADIFI_PERPETUAL"}
+
             EXCLUDE_BASES = {"USDC", "BUSD", "TUSD", "USDP", "DAI", "FDUSD", "BTCDOM", "DEFI", "ALTDOM"}
             EXCLUDE_SUFFIXES = ("UP", "DOWN", "3L", "3S", "5L", "5S", "BULL", "BEAR")
 
@@ -4238,6 +4252,12 @@ class TradingExecutor:
                 if price > 0 and price < 0.000001:
                     continue
                 if abs(change_pct) > 50:
+                    continue
+                # 过滤 TRADIFI_PERPETUAL（股票型永续合约，行情接口行为与加密合约不同）
+                mkt_key = symbol if symbol in markets else symbol.split(":")[0] + ":USDT" if ":" not in symbol else symbol
+                contract_type = (markets.get(mkt_key) or markets.get(symbol.split(":")[0]) or {}).get('info', {}).get('contractType', '')
+                if contract_type in EXCLUDE_CONTRACT_TYPES:
+                    logger.info(f"Symbol refresh: skip {symbol} (contractType={contract_type})")
                     continue
                 clean = symbol.split(":")[0]
                 candidates.append((quote_vol, clean))
@@ -4357,9 +4377,12 @@ class TradingExecutor:
             rankings = exec_env.get('rankings', [])
             stop_prices = exec_env.get('stop_prices', {})
 
-            # 如果没有提供rankings，根据scores排序
+            # 如果没有提供rankings，根据scores排序（只取 score > 0 的标的）
             if not rankings and scores:
-                rankings = sorted(scores.keys(), key=lambda x: scores.get(x, 0), reverse=True)
+                rankings = sorted(
+                    [k for k, v in scores.items() if (v or 0) > 0],
+                    key=lambda x: scores.get(x, 0), reverse=True
+                )
 
             return {
                 'scores': scores,
@@ -4576,55 +4599,69 @@ class TradingExecutor:
                 return False
 
         # 生成做多信号
-        for symbol in long_symbols:
-            if symbol not in current_long:
-                # 冷却期检查（止损/量缩横盘后 5 天内禁止重入）
-                if _in_cooldown(symbol):
-                    logger.info(f"Cooldown: skip open_long {symbol} (recent close within {COOLDOWN_DAYS}d)")
-                    continue
-                # 止损方向校验：多头止损必须在当前价下方
-                _stop_px = _stop_prices.get(symbol, 0)
-                if _stop_px > 0:
-                    _df_chk = _kdata.get(symbol)
-                    if _df_chk is not None and len(_df_chk) > 0:
-                        _cur_px_chk = float(_df_chk['close'].iloc[-1])
-                        if _stop_px >= _cur_px_chk:
-                            logger.warning(
-                                f"Stop direction invalid: {symbol} stop={_stop_px:.6g} >= cur={_cur_px_chk:.6g}, skip open"
-                            )
-                            continue
-                # 如果当前是空仓，先平空再开多
-                if symbol in current_short:
-                    signals.append({
-                        'symbol': symbol,
-                        'type': 'close_short',
-                        'score': scores.get(symbol, 0)
-                    })
-                # 计算突破量能（入场前 40 根最大成交量）
-                _bvol = 0.0
-                _df_s = _kdata.get(symbol)
-                if _df_s is not None and len(_df_s) >= 40:
-                    _bvol = float(_df_s['volume'].astype(float).tail(40).max())
-                _score_val = scores.get(symbol, 0)
-                _stop_px = _stop_prices.get(symbol) or 0
-                _cur_px_log = float(_df_s['close'].iloc[-1]) if _df_s is not None and len(_df_s) > 0 else 0
-                # 优先用 indicator_code 写入的精确类型，否则按分值推测
-                _sig_type = _signal_types.get(symbol) or ('二买' if _score_val > 65 else '三买')
-                logger.info(
-                    f"[开仓信号] {symbol} open_long | 评分={_score_val:.1f} 类型={_sig_type} "
-                    f"止损={_stop_px:.6g} 当前={_cur_px_log:.6g}"
-                )
-                append_strategy_log(
-                    strategy_id, "info",
-                    f"开仓 {symbol} | 评分={_score_val:.1f} [{_sig_type}] 止损={_stop_px:.6g} 当前={_cur_px_log:.6g}",
-                )
+        # 按评分从高到低遍历：只处理 score>0、在目标列表内、且未超持仓上限的标的
+        open_long_count = 0
+        for symbol in rankings:
+            # 持仓上限：现有持仓 + 本次新开不超过 portfolio_size
+            if len(current_long) + open_long_count >= portfolio_size:
+                break
+            # score=0 守卫：indicator_code 已过滤，此处双重保险
+            if (scores.get(symbol) or 0) <= 0:
+                continue
+            # 不在本次目标多头列表内（评分够但不在 top-N）
+            if symbol not in long_symbols:
+                continue
+            # 已持仓，跳过
+            if symbol in current_long:
+                continue
+            # 冷却期检查（止损/量缩横盘后 5 天内禁止重入）
+            if _in_cooldown(symbol):
+                logger.info(f"Cooldown: skip open_long {symbol} (recent close within {COOLDOWN_DAYS}d)")
+                continue
+            # 止损方向校验：多头止损必须在当前价下方
+            _stop_px = _stop_prices.get(symbol, 0)
+            if _stop_px > 0:
+                _df_chk = _kdata.get(symbol)
+                if _df_chk is not None and len(_df_chk) > 0:
+                    _cur_px_chk = float(_df_chk['close'].iloc[-1])
+                    if _stop_px >= _cur_px_chk:
+                        logger.warning(
+                            f"Stop direction invalid: {symbol} stop={_stop_px:.6g} >= cur={_cur_px_chk:.6g}, skip open"
+                        )
+                        continue
+            # 如果当前是空仓，先平空再开多
+            if symbol in current_short:
                 signals.append({
                     'symbol': symbol,
-                    'type': 'open_long',
-                    'score': _score_val,
-                    'stop_loss_price': _stop_px or None,
-                    'breakout_vol': _bvol,
+                    'type': 'close_short',
+                    'score': scores.get(symbol, 0)
                 })
+            # 计算突破量能（入场前 40 根最大成交量）
+            _bvol = 0.0
+            _df_s = _kdata.get(symbol)
+            if _df_s is not None and len(_df_s) >= 40:
+                _bvol = float(_df_s['volume'].astype(float).tail(40).max())
+            _score_val = scores.get(symbol, 0)
+            _stop_px = _stop_prices.get(symbol) or 0
+            _cur_px_log = float(_df_s['close'].iloc[-1]) if _df_s is not None and len(_df_s) > 0 else 0
+            # 优先用 indicator_code 写入的精确类型，否则按分值推测
+            _sig_type = _signal_types.get(symbol) or ('二买' if _score_val > 65 else '三买')
+            logger.info(
+                f"[开仓信号] {symbol} open_long | 评分={_score_val:.1f} 类型={_sig_type} "
+                f"止损={_stop_px:.6g} 当前={_cur_px_log:.6g}"
+            )
+            append_strategy_log(
+                strategy_id, "info",
+                f"开仓 {symbol} | 评分={_score_val:.1f} [{_sig_type}] 止损={_stop_px:.6g} 当前={_cur_px_log:.6g}",
+            )
+            signals.append({
+                'symbol': symbol,
+                'type': 'open_long',
+                'score': _score_val,
+                'stop_loss_price': _stop_px or None,
+                'breakout_vol': _bvol,
+            })
+            open_long_count += 1
 
         # 多头持仓：只靠止损/量缩横盘平仓，不因排名下滑而平仓（与回测逻辑一致）
 
@@ -4969,6 +5006,9 @@ class TradingExecutor:
                             exec_price = float(price_info) if price_info else 0.0
                         except Exception:
                             exec_price = 0.0
+                        if exec_price <= 0:
+                            logger.warning(f"Skip signal {signal['type']} {raw_sym}: price unavailable (got {exec_price})")
+                            continue
                         future = executor.submit(
                             self._execute_signal,
                             strategy_id=strategy_id,
