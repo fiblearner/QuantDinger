@@ -1,16 +1,15 @@
 """
-backtest_chan.py
-2026-01-01 ~ 今日  缠论截面策略逐日回测（仅做多）
-
-优先读取 kline_cache/ 本地缓存，缓存不存在时才从 API 拉取。
-先运行 cache_klines.py 初始化缓存可大幅加速。
+backtest_chan_volpb.py
+2025-01-01 ~ 2025-12-31  缠论截面策略回测（二买 / 三买 / vol-pullback 对比）
 
 用法:
-  docker exec quantdinger-backend python scripts/backtest_chan.py
-  本地: PROXY_URL=http://127.0.0.1:7890 python scripts/backtest_chan.py
+  本地: PROXY_URL=http://127.0.0.1:7890 python scripts/backtest_chan_volpb.py
+  离线: NO_FETCH=1 python scripts/backtest_chan_volpb.py
 
-环境变量:
-  NO_FETCH=1   只用本地缓存，缺失标的直接跳过（离线模式）
+说明:
+  基于 backtest_chan.py，在 score_symbol() 中加入 vol-pullback 逻辑（与
+  indicator_code_v4.1.py 生产代码保持一致），并在汇总中按信号类型拆分统计，
+  用于评估是否值得在实盘保留 vol-pullback 信号。
 """
 import os, sys, json, time as _time
 from datetime import datetime, timezone, timedelta
@@ -27,7 +26,7 @@ except ImportError:
 
 from pathlib import Path
 
-# ── 配置 ─────────────────────────────────────────────────────────────────────
+# ── 回测时间范围 ──────────────────────────────────────────────────────────────
 PROXY_URL       = os.environ.get("PROXY_URL", "")
 SYMBOLS_FILE    = os.environ.get(
     "SYMBOLS_FILE",
@@ -35,38 +34,40 @@ SYMBOLS_FILE    = os.environ.get(
 )
 CACHE_DIR       = Path(os.path.dirname(__file__)) / "kline_cache"
 NO_FETCH        = os.environ.get("NO_FETCH", "0") == "1"
-SIM_START       = datetime(2026, 1, 1, tzinfo=timezone.utc)
-SIM_END         = datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-WARMUP_DAYS     = 60          # SIM_START 前 60 天起拉数据作为暖机
+SIM_START       = datetime(2025, 1, 1, tzinfo=timezone.utc)
+SIM_END         = datetime(2025, 12, 31, tzinfo=timezone.utc)
+WARMUP_DAYS     = 60
 TIMEFRAME       = "4h"
-# 调仓时间（北京时间 CST=UTC+8），支持多个时间点，回测按对应 UTC 时刻切片
-REBALANCE_HOURS_UTC = [16, 4]   # 00:05 CST=16:05 UTC, 12:05 CST=04:05 UTC
+REBALANCE_HOURS_UTC = [16, 4]
 PORTFOLIO_SIZE  = 5
 INITIAL_CAPITAL = 10_000.0
 LEVERAGE        = 2
-ENTRY_PCT       = 0.20
+ENTRY_PCT       = 0.20        # 二买/三买仓位
+VP_ENTRY_PCT    = 0.10        # vol-pullback 仓位（与生产一致：高风险半仓）
 MIN_HOLD_HOURS  = 72
-BREAKEVEN_PCT   = 0.50        # 浮盈 50% 后止损上移至成本
-STOP_BUFFER     = 0.98        # 止损缓冲 2%（结构低点下方）
+BREAKEVEN_PCT   = 0.10
+STOP_BUFFER     = 0.98
 MAX_SYMBOLS     = 100
-COOLDOWN_DAYS   = 5           # 止损/量缩平仓后同标的冷却天数
+COOLDOWN_DAYS   = 5
 
-# 信号阈值（与生产一致，仅二买/三买）
-THRESHOLD_2B    = 60          # 二类买点入选分
-THRESHOLD_3B    = 60          # 三类买点入选分
-
-# 入场距离阈值（当前价距买点底部的最大涨幅）
-DIST_2B         = float(os.environ.get("DIST_2B", "0.20"))   # 二买：距上升笔起点 ≤ 20%（加密波动大，回测最优）
-DIST_3B         = float(os.environ.get("DIST_3B", "0.08"))   # 三买：距回踩低点 ≤ 8%
+# 信号阈值
+THRESHOLD_2B    = 60
+THRESHOLD_3B    = 60
 
 # 趋势过滤
-TREND_MA_BARS   = 240         # 60 日均线（4H × 240 根）
+TREND_MA_BARS   = 240
 
 # 量缩横盘出场
-VOL_CONSOL_DAYS   = 7         # 观察窗口（天）→ 42 根 4H
-VOL_CONSOL_PCT    = 0.08      # 近期高点未超过入场价 +8% 视为横盘
-VOL_SHRINK_RATIO  = 0.60      # 近期均量 < 突破量 × 60% 视为量缩
-VOL_MIN_HOLD_DAYS = 3         # 持仓至少 N 天后才检查量缩
+VOL_CONSOL_DAYS   = 7
+VOL_CONSOL_PCT    = 0.08
+VOL_SHRINK_RATIO  = 0.60
+VOL_MIN_HOLD_DAYS = 3
+
+# vol-pullback 信号参数（与 indicator_code_v4.1.py 完全一致）
+VP_SPIKE_RATIO   = 3.0    # 放量柱：量 > 60日均量 × 3
+VP_SPIKE_GAIN    = 0.10   # 放量柱：涨幅 > 10%
+VP_COOLDOWN_BARS = 12     # 放量后观察窗口（12根4H ≈ 2天）
+VP_SHRINK_RATIO  = 0.40   # 缩量：近3根量 < 放量柱 × 40%
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -112,10 +113,8 @@ def fetch_ohlcv_full(exchange: ccxt.Exchange, symbol: str,
         if len(bars) < 500:
             break
         _time.sleep(0.2)
-
     if not all_bars:
         return pd.DataFrame()
-
     df = pd.DataFrame(all_bars, columns=["ts", "open", "high", "low", "close", "volume"])
     df = df[df["ts"] < end_ms].copy()
     df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
@@ -142,118 +141,123 @@ def load_symbol_data(exchange, symbol: str,
             mask = (cached["ts"] >= since_ms) & (cached["ts"] < end_ms)
             return cached[mask].reset_index(drop=True)
 
-        parts = [cached]
+        pieces = []
         if need_prepend:
             pre = fetch_ohlcv_full(exchange, symbol, since_dt,
                                    datetime.fromtimestamp(cache_start / 1000, tz=timezone.utc))
             if not pre.empty:
-                parts.insert(0, pre)
+                pieces.append(pre)
+        pieces.append(cached)
         if need_append:
-            post = fetch_ohlcv_full(
-                exchange, symbol,
-                datetime.fromtimestamp((cache_end + 1) / 1000, tz=timezone.utc),
-                end_dt,
-            )
-            if not post.empty:
-                parts.append(post)
-
-        merged = pd.concat(parts, ignore_index=True)
-        merged = merged.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        merged[["ts", "open", "high", "low", "close", "volume"]].to_csv(
-            cache_path(symbol), index=False
-        )
+            app = fetch_ohlcv_full(exchange, symbol,
+                                   datetime.fromtimestamp(cache_end / 1000, tz=timezone.utc),
+                                   end_dt)
+            if not app.empty:
+                pieces.append(app)
+        merged = pd.concat(pieces).drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+        merged["dt"] = pd.to_datetime(merged["dt"] if "dt" in merged else merged["ts"], unit="ms" if "dt" not in merged.columns else None, utc=True)
         mask = (merged["ts"] >= since_ms) & (merged["ts"] < end_ms)
         return merged[mask].reset_index(drop=True)
 
     if NO_FETCH:
         return pd.DataFrame()
-
     df = fetch_ohlcv_full(exchange, symbol, since_dt, end_dt)
-    if not df.empty:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df[["ts", "open", "high", "low", "close", "volume"]].to_csv(
-            cache_path(symbol), index=False
-        )
     return df
 
 
-# ── 缠论核心函数 ──────────────────────────────────────────────────────────────
+# ── 缠论计算（与 backtest_chan.py 完全一致） ───────────────────────────────────
 
-def merge_inclusion(highs, lows):
-    ph, pl = list(highs), list(lows)
-    direction = 1
-    for i in range(1, len(ph)):
-        h0, h1, l0, l1 = ph[i-1], ph[i], pl[i-1], pl[i]
-        if (h1 <= h0 and l1 >= l0) or (h1 >= h0 and l1 <= l0):
-            if direction >= 0:
-                ph[i], pl[i] = max(h0, h1), max(l0, l1)
+def merge_inclusion(high: list, low: list):
+    n = len(high)
+    ph, pl = list(high), list(low)
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(ph) - 1:
+            h1, l1 = ph[i], pl[i]
+            h2, l2 = ph[i+1], pl[i+1]
+            if (h1 >= h2 and l1 <= l2) or (h2 >= h1 and l2 <= l1):
+                if h1 >= h2:
+                    ph[i] = max(h1, h2); pl[i] = max(l1, l2)
+                else:
+                    ph[i] = max(h1, h2); pl[i] = min(l1, l2)
+                ph.pop(i+1); pl.pop(i+1)
+                changed = True
             else:
-                ph[i], pl[i] = min(h0, h1), min(l0, l1)
-        else:
-            direction = 1 if h1 > h0 else -1
+                i += 1
     return ph, pl
 
 
-def find_fractals(ph, pl):
-    tops, bottoms = [], []
-    for i in range(1, len(ph) - 1):
-        if ph[i] > ph[i-1] and ph[i] > ph[i+1] and pl[i] > pl[i-1] and pl[i] > pl[i+1]:
+def find_fractals(ph: list, pl: list):
+    tops, bots = [], []
+    for i in range(1, len(ph)-1):
+        if ph[i] > ph[i-1] and ph[i] > ph[i+1]:
             tops.append((i, ph[i]))
-        if pl[i] < pl[i-1] and pl[i] < pl[i+1] and ph[i] < ph[i-1] and ph[i] < ph[i+1]:
-            bottoms.append((i, pl[i]))
-    return tops, bottoms
+        if pl[i] < pl[i-1] and pl[i] < pl[i+1]:
+            bots.append((i, pl[i]))
+    return tops, bots
 
 
-def find_bi(tops, bottoms, min_gap=4):
-    events = [(i, p, 'top') for i, p in tops] + [(i, p, 'bot') for i, p in bottoms]
+def find_bi(tops: list, bots: list):
+    events = [(i, 'top', v) for i, v in tops] + [(i, 'bot', v) for i, v in bots]
     events.sort(key=lambda x: x[0])
-    if not events:
-        return []
-    pivots = []
-    for ev in events:
-        idx, price, kind = ev
-        if not pivots:
-            pivots.append(ev)
+    bi_list = []
+    last = None
+    for idx, kind, val in events:
+        if last is None:
+            last = (idx, kind, val)
             continue
-        li, lp, lk = pivots[-1]
-        if kind == lk:
-            if (kind == 'top' and price > lp) or (kind == 'bot' and price < lp):
-                pivots[-1] = ev
+        if kind == last[1]:
+            if (kind == 'top' and val >= last[2]) or (kind == 'bot' and val <= last[2]):
+                last = (idx, kind, val)
         else:
-            if idx - li >= min_gap:
-                pivots.append(ev)
-            else:
-                if (kind == 'top' and price > lp) or (kind == 'bot' and price < lp):
-                    pivots[-1] = ev
-    bi = []
-    for i in range(1, len(pivots)):
-        p0, p1 = pivots[i-1], pivots[i]
-        bi.append({'start': p0, 'end': p1, 'dir': 1 if p1[2] == 'top' else -1})
-    return bi
+            bi_list.append({
+                'dir': 1 if last[1] == 'bot' else -1,
+                'start': (last[0], last[2]),
+                'end': (idx, val),
+            })
+            last = (idx, kind, val)
+    return bi_list
 
 
-def find_zhongshu(bi_list):
-    zs = []
-    if len(bi_list) < 3:
-        return zs
-    for i in range(len(bi_list) - 2):
-        b1, b2, b3 = bi_list[i], bi_list[i+1], bi_list[i+2]
-        highs = [max(b['start'][1], b['end'][1]) for b in [b1, b2, b3]]
-        lows  = [min(b['start'][1], b['end'][1]) for b in [b1, b2, b3]]
-        ZG, ZD = min(highs), max(lows)
+def find_zhongshu(bi_list: list):
+    zs_list = []
+    i = 0
+    while i + 2 < len(bi_list):
+        b0, b1, b2 = bi_list[i], bi_list[i+1], bi_list[i+2]
+        h0 = max(b0['start'][1], b0['end'][1])
+        l0 = min(b0['start'][1], b0['end'][1])
+        h1 = max(b1['start'][1], b1['end'][1])
+        l1 = min(b1['start'][1], b1['end'][1])
+        h2 = max(b2['start'][1], b2['end'][1])
+        l2 = min(b2['start'][1], b2['end'][1])
+        ZG = min(h0, h1, h2)
+        ZD = max(l0, l1, l2)
         if ZG > ZD:
-            if zs and zs[-1]['end_bi'] >= i:
-                zs[-1]['ZG'] = min(zs[-1]['ZG'], ZG)
-                zs[-1]['ZD'] = max(zs[-1]['ZD'], ZD)
-                zs[-1]['end_bi'] = i + 2
-            else:
-                zs.append({'ZG': ZG, 'ZD': ZD, 'start_bi': i, 'end_bi': i + 2})
-    return zs
+            zs = {'ZG': ZG, 'ZD': ZD, 'start_bi': i, 'end_bi': i+2}
+            j = i + 3
+            while j < len(bi_list):
+                bj = bi_list[j]
+                bj_h = max(bj['start'][1], bj['end'][1])
+                bj_l = min(bj['start'][1], bj['end'][1])
+                if bj_h >= ZD and bj_l <= ZG:
+                    ZG = min(ZG, bj_h)
+                    ZD = max(ZD, bj_l)
+                    zs['end_bi'] = j
+                    zs['ZG'] = ZG
+                    zs['ZD'] = ZD
+                    j += 1
+                else:
+                    break
+            zs_list.append(zs)
+            i = zs['end_bi'] + 1
+        else:
+            i += 1
+    return zs_list
 
 
 def _volume_breakout_ok(vol: pd.Series) -> bool:
-    """量能萎缩时要求放量，正常量能直接放行。与生产逻辑一致：近14根/近90根均量。"""
     if len(vol) < 90:
         return True
     v14 = float(vol.tail(14).mean())
@@ -269,9 +273,8 @@ def _volume_breakout_ok(vol: pd.Series) -> bool:
 
 
 def score_symbol(df: pd.DataFrame) -> Tuple[float, float, str]:
-    """返回 (score, stop_price, signal_type)，仅输出多头信号（≥0）。
-    signal_type: '2b'=二买  '3b'=三买  ''=无信号
-    （一类买点已移除，与生产保持一致）
+    """返回 (score, stop_price, signal_type)
+    signal_type: '2b' | '3b' | 'vol-pullback' | ''
     """
     if len(df) < 80:
         return 0.0, 0.0, ''
@@ -309,8 +312,8 @@ def score_symbol(df: pd.DataFrame) -> Tuple[float, float, str]:
                 bot = lp_['start'][1]
                 if bot > lz['ZD']:
                     dist = (cur - bot) / (bot + 1e-9)
-                    if 0 <= dist < DIST_2B:
-                        s2 = 75 * (1 - dist / DIST_2B)
+                    if 0 <= dist < 0.12:
+                        s2 = 75 * (1 - dist / 0.12)
                         if s2 > score:
                             score, stop, signal_type = s2, round(lz['ZD'] * STOP_BUFFER, 8), '2b'
 
@@ -325,48 +328,73 @@ def score_symbol(df: pd.DataFrame) -> Tuple[float, float, str]:
                     pbot = pb['end'][1]
                     if pbot > lz['ZG']:
                         dist = (cur - pbot) / (pbot + 1e-9)
-                        if 0 <= dist < DIST_3B:
-                            s3 = 65 * (1 - dist / DIST_3B)
+                        if 0 <= dist < 0.08:
+                            s3 = 65 * (1 - dist / 0.08)
                             if s3 > score:
                                 score, stop, signal_type = s3, round(lz['ZG'] * STOP_BUFFER, 8), '3b'
 
-    # ── RSI 加权（多头） ───────────────────────────────────────────────────────
+    # ── RSI 加权（二买/三买） ─────────────────────────────────────────────────
     if score > 0:
         if rsi_v < 35:
             score = min(100, score * 1.25)
         elif rsi_v > 70:
             score *= 0.6
 
+    # ── vol-pullback（方案三：放量大阳后缩量回踩） ────────────────────────────
+    if len(df) >= 180:
+        _v60 = float(vol.tail(360).mean()) if len(vol) >= 360 else float(vol.mean())
+        if _v60 > 0:
+            _window = df.tail(VP_COOLDOWN_BARS + 1).iloc[:-1]
+            _spike_vol = 0.0; _spike_low = 0.0; _spike_high = 0.0; _spike_idx = -1
+            for _ri in range(len(_window) - 1, -1, -1):
+                _row  = _window.iloc[_ri]
+                _vi   = float(_row['volume'])
+                _o    = float(_row['open'])
+                _ci   = float(_row['close'])
+                _gain = (_ci - _o) / max(_o, 1e-9)
+                if _vi >= _v60 * VP_SPIKE_RATIO and _gain >= VP_SPIKE_GAIN:
+                    _spike_vol  = _vi
+                    _spike_low  = float(_row['low'])
+                    _spike_high = float(_row['high'])
+                    _spike_idx  = _window.index[_ri]
+                    break
+            if _spike_vol > 0:
+                _recent3 = vol.tail(3)
+                _shrink  = float(_recent3.mean()) < _spike_vol * VP_SHRINK_RATIO
+                _intact  = cur >= _spike_low
+                _bars_after = df[df.index > _spike_idx]
+                _post_low   = float(_bars_after['low'].min()) if len(_bars_after) > 0 else cur
+                _support_broken = _post_low < _spike_low
+                _drawdown_from_spike = (_spike_high - cur) / _spike_high if _spike_high > 0 else 0
+                _excessive_drop = _drawdown_from_spike > 0.20
+                if _shrink and _intact and not _support_broken and not _excessive_drop:
+                    _vs = 65.0
+                    if rsi_v < 35:
+                        _vs = min(100, _vs * 1.25)
+                    elif rsi_v > 70:
+                        _vs *= 0.6
+                    _vstop = round(_spike_low * STOP_BUFFER, 8)
+                    if _vstop > 0 and _vstop < cur and _vs >= 60 and _vs > score:
+                        score      = _vs
+                        stop       = _vstop
+                        signal_type = 'vol-pullback'
+
     # ── 阈值过滤 ──────────────────────────────────────────────────────────────
-    thresholds = {'2b': THRESHOLD_2B, '3b': THRESHOLD_3B}
-    if score < thresholds.get(signal_type, THRESHOLD_2B):
+    threshold = THRESHOLD_2B if signal_type in ('2b', '') else THRESHOLD_3B
+    if score < threshold:
         return 0.0, 0.0, ''
 
     return round(score, 2), stop, signal_type
 
 
 def _trail_stop_mult(level: int) -> float:
-    """阶梯锁利乘数：
-    level 1 → ×1.0 保本
-    level 2 → ×2.0 锁住100%（浮盈200%触发）
-    level 3 → ×3.0 锁住200%（浮盈300%触发）
-    以此类推：stop = entry × level
-    """
-    return float(level)
-
-
-# ── 回测主逻辑 ────────────────────────────────────────────────────────────────
-
-def _pos_pnl(pos: Dict, cur_px: float) -> Tuple[float, float]:
-    """返回 (pnl_pct, pnl_usd)。"""
-    entry_px = pos['entry_price']
-    pnl_pct  = (cur_px - entry_px) / entry_px * 100
-    pnl_usd  = pnl_pct / 100 * (INITIAL_CAPITAL * ENTRY_PCT * LEVERAGE)
-    return round(pnl_pct, 2), round(pnl_usd, 2)
+    if level == 1: return 1.0
+    if level == 2: return 1.2
+    if level == 3: return 1.5
+    return float(level - 2)
 
 
 def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
-    # 生成调仓时间点列表：每天按 REBALANCE_HOURS_UTC 触发
     rebalance_slots = []
     d = SIM_START.replace(hour=0, minute=0, second=0, microsecond=0)
     while d <= SIM_END:
@@ -379,18 +407,27 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
 
     positions: Dict[str, Dict] = {}
     cooldown_until: Dict[str, object] = {}
-
     equity    = INITIAL_CAPITAL
     trade_log: List[Dict] = []
 
     print(f"\n{'='*80}")
-    print(f"  缠论截面策略回测（仅做多 二买/三买）  {SIM_START.date()} → {SIM_END.date()}")
+    print(f"  缠论策略回测（二买 / 三买 / vol-pullback 对比）  {SIM_START.date()} → {SIM_END.date()}")
     print(f"  标的数: {len(symbol_map)}  组合上限: {PORTFOLIO_SIZE}  杠杆: {LEVERAGE}×")
-    print(f"  单仓: {int(ENTRY_PCT*100)}%  最短持仓: {MIN_HOLD_HOURS}h  保本触发: {int(BREAKEVEN_PCT*100)}%")
+    print(f"  二买/三买仓位: {int(ENTRY_PCT*100)}%  vol-pullback仓位: {int(VP_ENTRY_PCT*100)}%")
     print(f"  止损冷却: {COOLDOWN_DAYS}天  止损缓冲: {int((1-STOP_BUFFER)*100)}%")
     cst_desc = ', '.join(f"{(h+8)%24:02d}:05" for h in sorted(REBALANCE_HOURS_UTC))
     print(f"  调仓时间: {cst_desc} (北京时间)  共 {len(rebalance_slots)} 个调仓点")
     print(f"{'='*80}\n")
+
+    def get_entry_pct(stype: str) -> float:
+        return VP_ENTRY_PCT if stype == 'vol-pullback' else ENTRY_PCT
+
+    def pos_pnl(pos: Dict, cur_px: float) -> Tuple[float, float]:
+        entry_px  = pos['entry_price']
+        ep        = pos.get('entry_pct', ENTRY_PCT)
+        pnl_pct   = (cur_px - entry_px) / entry_px * 100
+        pnl_usd   = pnl_pct / 100 * (INITIAL_CAPITAL * ep * LEVERAGE)
+        return round(pnl_pct, 2), round(pnl_usd, 2)
 
     def get_cur_px(sym: str) -> Optional[float]:
         df_ = symbol_map.get(sym)
@@ -405,10 +442,8 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
     for slot in rebalance_slots:
         day_str = slot.strftime("%Y-%m-%d %H:%M")
 
-        # ── 清理过期冷却 ──────────────────────────────────────────────────────
         cooldown_until = {s: dt for s, dt in cooldown_until.items() if dt > slot}
 
-        # ── 评分所有标的 ──────────────────────────────────────────────────────
         day_scores: Dict[str, float] = {}
         day_stops:  Dict[str, float] = {}
         day_types:  Dict[str, str]   = {}
@@ -426,10 +461,9 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             except Exception:
                 pass
 
-        # 按评分从高到低排列（全为正分）
         ranking = sorted(day_scores.keys(), key=lambda s: day_scores[s], reverse=True)
 
-        # ── 1. 止损检查：逐根 4H K线模拟止损委托 ────────────────────────────
+        # ── 1. 止损检查 ────────────────────────────────────────────────────────
         for sym in list(positions.keys()):
             pos       = positions[sym]
             entry_px  = pos['entry_price']
@@ -448,35 +482,37 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
                 bar_low   = float(bar['low'])
                 float_pct = (bar_close / entry_px - 1) * 100
 
-                # 阶梯锁利：保本 + 每100%一档（200%锁100%，300%锁200%……）
-                if float_pct >= BREAKEVEN_PCT * 100:
-                    new_level = max(1, int(float_pct // 100))
-                else:
-                    new_level = 0
+                if float_pct >= 300:   new_level = 5
+                elif float_pct >= 200: new_level = 4
+                elif float_pct >= 100: new_level = 3
+                elif float_pct >= 50:  new_level = 2
+                elif float_pct >= BREAKEVEN_PCT * 100: new_level = 1
+                else:                  new_level = 0
                 if new_level > pos['trail_level']:
                     pos['trail_level'] = new_level
 
                 tl = pos['trail_level']
                 if tl > 0:
-                    eff = max(struct_sl, entry_px * _trail_stop_mult(tl))
+                    eff_stop = max(struct_sl, entry_px * _trail_stop_mult(tl))
                 else:
-                    eff = struct_sl
+                    eff_stop = struct_sl
                 struct_hit = bar_low   < struct_sl
                 trail_hit  = tl > 0 and bar_close < entry_px * _trail_stop_mult(tl)
                 if struct_hit or trail_hit:
-                    hit_bar, eff_stop = bar, eff
+                    hit_bar = bar
                     break
 
             if hit_bar is None:
                 continue
 
-            pnl_pct, pnl_usd = _pos_pnl(pos, eff_stop)
+            pnl_pct, pnl_usd = pos_pnl(pos, eff_stop)
             equity += pnl_usd
             tl = pos.get('trail_level', 0)
             trail_tag = f" [锁利{(tl-1)*100}%]" if tl >= 2 else (" [保本]" if tl == 1 else "")
             trade_log.append({
                 'date': day_str, 'action': '止损平仓',
                 'symbol': sym, 'price': eff_stop, 'score': pos['score'],
+                'signal_type': pos.get('signal_type', ''),
                 'stop': eff_stop, 'pnl%': pnl_pct, 'pnl$': pnl_usd,
                 'hold_h': round((slot - pos['entry_time']).total_seconds() / 3600, 1),
                 'reason': f"破止损 {eff_stop:.6g}{trail_tag}",
@@ -484,8 +520,8 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             cooldown_until[sym] = slot + timedelta(days=COOLDOWN_DAYS)
             del positions[sym]
 
-        # ── 2. 量缩横盘出场（持仓 ≥ VOL_MIN_HOLD_DAYS 后检查）────────────────
-        consol_bars = VOL_CONSOL_DAYS * 6  # 7天 × 6根4H = 42根
+        # ── 2. 量缩横盘出场 ────────────────────────────────────────────────────
+        consol_bars = VOL_CONSOL_DAYS * 6
         for sym in list(positions.keys()):
             pos = positions[sym]
             held_days = (slot - pos['entry_time']).total_seconds() / 86400
@@ -510,86 +546,76 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             cur_px = get_cur_px(sym)
             if cur_px is None:
                 continue
-            pnl_pct, pnl_usd = _pos_pnl(pos, cur_px)
+            pnl_pct, pnl_usd = pos_pnl(pos, cur_px)
             equity += pnl_usd
             trade_log.append({
                 'date': day_str, 'action': '量缩横盘平仓',
                 'symbol': sym, 'price': cur_px, 'score': pos['score'],
+                'signal_type': pos.get('signal_type', ''),
                 'stop': pos['stop'], 'pnl%': pnl_pct, 'pnl$': pnl_usd,
                 'hold_h': round((slot - pos['entry_time']).total_seconds() / 3600, 1),
-                'reason': f"量缩横盘 avg_vol={recent_vol:.0f} < breakout×{VOL_SHRINK_RATIO}={breakout_vol*VOL_SHRINK_RATIO:.0f}",
+                'reason': f"量缩横盘",
             })
             cooldown_until[sym] = slot + timedelta(days=COOLDOWN_DAYS)
             del positions[sym]
 
-        # ── 3. 开仓：评分排名靠前、未持仓、未冷却、组合有空位 ────────────────
+        # ── 3. 开仓 ────────────────────────────────────────────────────────────
         for sym in ranking:
             if len(positions) >= PORTFOLIO_SIZE:
                 break
             if sym in positions or sym in cooldown_until:
                 continue
-
             stype = day_types.get(sym, '')
-
-            # 个股趋势过滤：收盘价须在 60 日均线以上
             df_ = symbol_map.get(sym)
             if df_ is not None:
                 snap_close = df_[df_['dt'] < slot]['close'].astype(float)
                 if len(snap_close) >= TREND_MA_BARS:
                     if float(snap_close.iloc[-1]) < float(snap_close.tail(TREND_MA_BARS).mean()):
                         continue
-
-            # 量能萎缩过滤
             if df_ is not None:
                 snap_vol = df_[df_['dt'] < slot]['volume'].astype(float).reset_index(drop=True)
                 if not _volume_breakout_ok(snap_vol):
                     continue
-
             cur_px = get_cur_px(sym)
             if cur_px is None:
                 continue
-
             stop = day_stops.get(sym, 0)
-            # 止损方向校验：止损位必须在当前价下方
             if stop > 0 and stop >= cur_px:
                 continue
-
+            ep   = get_entry_pct(stype)
             bvol = float(df_[df_['dt'] < slot]['volume'].astype(float).tail(40).max()) \
                    if df_ is not None else 0.0
             positions[sym] = {
                 'entry_price': cur_px, 'entry_time': slot,
                 'score': day_scores[sym], 'stop': stop,
                 'signal_type': stype, 'trail_level': 0,
-                'breakout_vol': bvol,
+                'breakout_vol': bvol, 'entry_pct': ep,
             }
             trade_log.append({
                 'date': day_str, 'action': '开仓',
                 'symbol': sym, 'price': cur_px, 'score': day_scores[sym],
+                'signal_type': stype,
                 'stop': stop, 'pnl%': 0, 'pnl$': 0, 'hold_h': 0,
-                'reason': f"{stype} score={day_scores[sym]}",
+                'reason': f"{stype} score={day_scores[sym]} pct={int(ep*100)}%",
             })
 
         # ── 打印有操作的时间点 ────────────────────────────────────────────────
         day_trades = [t for t in trade_log if t['date'] == day_str]
         if day_trades:
-            cd_list = list(cooldown_until.keys())
             print(f"\n{'─'*80}")
-            print(f"  {day_str}  持仓: {len(positions)}/{PORTFOLIO_SIZE}"
-                  f"  净值: ${equity:,.2f}"
-                  + (f"  冷却: {cd_list}" if cd_list else ""))
+            print(f"  {day_str}  持仓: {len(positions)}/{PORTFOLIO_SIZE}  净值: ${equity:,.2f}")
             for t in day_trades:
+                stype_tag = f"[{t.get('signal_type','?')}]"
                 if t['action'] == '开仓':
                     print(f"    ▶ 开多 {t['symbol']:<20} @{t['price']:.6g}"
-                          f"  score={t['score']:>+8.2f}  止损={t['stop']:.6g}")
+                          f"  {stype_tag}  score={t['score']:>+8.2f}  止损={t['stop']:.6g}")
                 elif t['action'] == '止损平仓':
                     print(f"    ✕ 止损 {t['symbol']:<20} @{t['price']:.6g}"
-                          f"  持仓={t['hold_h']}h  {t['pnl%']}%  (${t['pnl$']:.2f})"
-                          f"  {t['reason']}")
+                          f"  {stype_tag}  持仓={t['hold_h']}h  {t['pnl%']}%  (${t['pnl$']:.2f})")
                 elif t['action'] == '量缩横盘平仓':
                     sign = "+" if t['pnl%'] >= 0 else ""
                     print(f"    ◈ 量缩 {t['symbol']:<20} @{t['price']:.6g}"
-                          f"  持仓={t['hold_h']}h  {sign}{t['pnl%']}%  ({sign}${t['pnl$']:.2f})"
-                          f"  {t['reason']}")
+                          f"  {stype_tag}  持仓={t['hold_h']}h  {sign}{t['pnl%']}%  ({sign}${t['pnl$']:.2f})")
 
         prev_slot = slot
 
@@ -602,14 +628,15 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
             continue
         cur_px = float(df_.iloc[-1]['close'])
         held_h = (SIM_END - pos['entry_time']).total_seconds() / 3600
-        pnl_pct, pnl_usd = _pos_pnl(pos, cur_px)
+        pnl_pct, pnl_usd = pos_pnl(pos, cur_px)
         equity += pnl_usd
         sign = "+" if pnl_pct >= 0 else ""
-        print(f"    多 {sym:<20} @{cur_px:.6g}  持仓={held_h:.0f}h  "
-              f"{sign}{pnl_pct:.2f}%  ({sign}${pnl_usd:.2f})")
+        print(f"    多 {sym:<20} @{cur_px:.6g}  [{pos.get('signal_type','?')}]"
+              f"  持仓={held_h:.0f}h  {sign}{pnl_pct:.2f}%  ({sign}${pnl_usd:.2f})")
         trade_log.append({
             'date': SIM_END.strftime("%Y-%m-%d"), 'action': '模拟结束平仓',
             'symbol': sym, 'price': cur_px, 'score': pos['score'],
+            'signal_type': pos.get('signal_type', ''),
             'stop': pos['stop'], 'pnl%': pnl_pct, 'pnl$': pnl_usd,
             'hold_h': round(held_h, 1), 'reason': '模拟结束',
         })
@@ -640,18 +667,35 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
     if loses:
         print(f"  平均亏损     : ${sum(t['pnl$'] for t in loses)/len(loses):,.2f}")
 
+    # ── 按信号类型拆分统计 ────────────────────────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  按信号类型拆分统计:")
+    print(f"  {'类型':<16} {'开仓':>6} {'已平':>6} {'盈利':>6} {'止损':>6} {'胜率':>8} {'总盈亏':>12} {'平均盈亏':>12}")
+    print(f"  {'-'*78}")
+    for stype in ['2b', '3b', 'vol-pullback']:
+        o_n  = [t for t in opens      if t.get('signal_type') == stype]
+        c_n  = [t for t in all_closed if t.get('signal_type') == stype]
+        sl_n = [t for t in stops_l    if t.get('signal_type') == stype]
+        w_n  = [t for t in c_n        if t['pnl%'] > 0]
+        wr_n = len(w_n) / len(c_n) * 100 if c_n else 0
+        tp_n = sum(t['pnl$'] for t in c_n)
+        ap_n = tp_n / len(c_n) if c_n else 0
+        print(f"  {stype:<16} {len(o_n):>6} {len(c_n):>6} {len(w_n):>6} {len(sl_n):>6}"
+              f"  {wr_n:>6.1f}%  ${tp_n:>+10.2f}  ${ap_n:>+10.2f}")
+
+    # ── 完整交易记录 ──────────────────────────────────────────────────────────
     print(f"\n  完整交易记录（{len(trade_log)} 条）：")
-    print(f"  {'日期':<12} {'操作':<8} {'标的':<18} {'价格':>12} {'评分':>9} "
-          f"{'止损价':>12} {'持仓h':>7} {'收益%':>8} {'收益$':>9}")
-    print(f"  {'-'*97}")
+    print(f"  {'日期':<12} {'操作':<8} {'类型':<14} {'标的':<18} {'价格':>10} "
+          f"{'评分':>8} {'持仓h':>7} {'收益%':>8} {'收益$':>9}")
+    print(f"  {'-'*100}")
     for t in trade_log:
         sign = "+" if t['pnl%'] > 0 else ""
-        print(f"  {t['date']:<12} {t['action']:<8} {t['symbol']:<18} "
-              f"{t['price']:>12.6g} {t['score']:>+9.2f} "
-              f"{t['stop']:>12.6g} {t['hold_h']:>7.1f} "
-              f"{sign+str(t['pnl%'])+'%':>8} {('+' if t['pnl$']>=0 else '')+str(t['pnl$']):>9}")
+        print(f"  {t['date']:<12} {t['action']:<8} {t.get('signal_type',''):<14}"
+              f" {t['symbol']:<18} {t['price']:>10.6g} {t['score']:>+8.2f}"
+              f" {t['hold_h']:>7.1f} {sign+str(t['pnl%'])+'%':>8}"
+              f" {('+' if t['pnl$']>=0 else '')+str(t['pnl$']):>9}")
 
-    out = os.path.join(os.path.dirname(__file__), "backtest_result.json")
+    out = os.path.join(os.path.dirname(__file__), "backtest_volpb_result.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump({
             "summary": {
@@ -662,6 +706,16 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
                 "total_pnl": round(total_pnl, 2),
                 "final_equity": round(equity, 2),
                 "return_pct": round((equity / INITIAL_CAPITAL - 1) * 100, 2),
+                "by_signal": {
+                    stype: {
+                        "opens": len([t for t in opens if t.get('signal_type') == stype]),
+                        "closed": len([t for t in all_closed if t.get('signal_type') == stype]),
+                        "stops": len([t for t in stops_l if t.get('signal_type') == stype]),
+                        "wins": len([t for t in all_closed if t.get('signal_type') == stype and t['pnl%'] > 0]),
+                        "total_pnl": round(sum(t['pnl$'] for t in all_closed if t.get('signal_type') == stype), 2),
+                    }
+                    for stype in ['2b', '3b', 'vol-pullback']
+                }
             },
             "trades": trade_log,
         }, f, indent=2, ensure_ascii=False)
@@ -671,7 +725,7 @@ def run_backtest(symbol_map: Dict[str, pd.DataFrame]) -> None:
 
 def main():
     if not os.path.exists(SYMBOLS_FILE):
-        print(f"[ERROR] 找不到 {SYMBOLS_FILE}，请先运行 fetch_top_symbols.py")
+        print(f"[ERROR] 找不到 {SYMBOLS_FILE}")
         sys.exit(1)
     with open(SYMBOLS_FILE, encoding="utf-8") as f:
         raw = json.load(f)
