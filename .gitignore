@@ -78,6 +78,12 @@ backend_api_python/data/quantdinger.db
 backend_api_python/data/memory/
 
 # ========================
+# 本地生成数据（缠论分析结果等）
+# ========================
+# 解压后的单股 JSON 目录（从 data/zhongshu.tar.gz 解压，不入库）
+/data/zhongshu/
+
+# ========================
 # i18n tooling
 # ========================
 scripts/.i18n-cache/
