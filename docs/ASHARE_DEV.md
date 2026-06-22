@@ -16,7 +16,6 @@
 | 格式 | 二进制 `.day` 文件（32 字节/记录，小端序） |
 | 覆盖 | 沪 ~4768 只 / 深 ~4269 只 / 京 少量，共 ~9362 只 |
 | 更新 | 每个交易日收盘后通达信客户端自动更新 |
-| 详细格式 | 见 [`docs/TDX_DATA.md`](TDX_DATA.md) |
 
 ```
 D:\tongdaxin\vipdoc\
@@ -25,6 +24,39 @@ D:\tongdaxin\vipdoc\
 ├── sz\lday\sz000001.day   # 深证成指
 └── bj\lday\bj810011.day   # 北交所个股
 ```
+
+#### .day 文件格式
+
+无文件头，由连续的定长记录组成，每条记录 **32 字节，小端序**：
+
+| 字节偏移 | 字节数 | 类型 | 说明 |
+|----------|--------|------|------|
+| 0 | 4 | `uint32` | 日期（`YYYYMMDD`） |
+| 4 | 4 | `uint32` | 开盘价 × 100 |
+| 8 | 4 | `uint32` | 最高价 × 100 |
+| 12 | 4 | `uint32` | 最低价 × 100 |
+| 16 | 4 | `uint32` | 收盘价 × 100 |
+| 20 | 4 | `float32` | 成交额（元） |
+| 24 | 4 | `uint32` | 成交量（手） |
+| 28 | 4 | `uint32` | 保留字段 |
+
+```python
+import struct
+
+def load_day_file(filepath: str) -> list[dict]:
+    records = []
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    for i in range(0, len(data) - 31, 32):
+        d, o, h, l, c, amt, vol, _ = struct.unpack('<IIIIIfII', data[i:i+32])
+        if d == 0:
+            continue
+        records.append({'date': d, 'open': o/100, 'high': h/100,
+                         'low': l/100, 'close': c/100, 'amount': amt, 'volume': vol})
+    return records
+```
+
+sh000001（上证指数）数据范围：20210802 ~ 20260622，共 1182 条。
 
 ---
 
@@ -179,7 +211,3 @@ for z in zs["zhongshu"]:
 - [ ] **批量查询工具** — 按交易所 / 板块 / 中枢笔数过滤和导出
 
 ---
-
-## 相关文档
-
-- [`docs/TDX_DATA.md`](TDX_DATA.md) — 通达信 `.day` 文件格式详解
