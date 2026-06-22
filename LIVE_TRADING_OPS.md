@@ -329,20 +329,15 @@ docker logs quantdinger-backend --since 24h 2>&1 | grep 'Skip signal'
 
 ---
 
-### 坑 2：`timedelta` NameError 导致每轮都触发调仓（未修复）
+### 坑 2：`timedelta` NameError 导致每轮都触发调仓（已修复）
 
 **现象**：策略日志每 300s 就触发一次全量扫描，`_should_rebalance` 永远返回 True，CPU/API 调用偏高。日志中有 `Failed to check rebalance: name 'timedelta' is not defined`（2026-06-08 起出现）。
 
 **根因**：`trading_executor.py` 中 `_should_rebalance` 方法内部使用了 `timedelta` 但作用域内未导入，抛出 `NameError` 被 `except Exception: return True` 吞掉，导致逻辑始终认为需要调仓。
 
-**临时影响**：目前每轮都调仓，无功能故障，但浪费 API 配额，待修复。
+**历史影响**：已导致 2026-06-13 FOLKS/USDT 和 GWEI/USDT 各重复开仓 1~2 笔。
 
-**修复方向**：在该方法顶部补 `from datetime import timedelta`，或在文件顶层 import 区域检查是否缺失。
-
-**排查命令**：
-```bash
-docker logs quantdinger-backend --since 7d 2>&1 | grep 'Failed to check rebalance'
-```
+**修复**：在 `_should_rebalance` 方法顶部补 `from datetime import timedelta`，已部署。
 
 ---
 
