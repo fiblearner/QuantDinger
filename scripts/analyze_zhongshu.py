@@ -77,21 +77,25 @@ def remove_containment(bars: list[dict]) -> list[dict]:
         # 检查包含关系
         if (h1 >= h2 and l1 <= l2) or (h2 >= h1 and l2 <= l1):
             if len(result) >= 2:
-                trend_up = prev["high"] > result[-2]["high"]
+                prev2 = result[-2]
+                # 缠论标准：高低点同向确定趋势；高点相等时看低点
+                trend_up = prev["high"] > prev2["high"] or (
+                    prev["high"] == prev2["high"] and prev["low"] > prev2["low"]
+                )
             else:
-                trend_up = True  # 默认上升
+                trend_up = True  # 无前置参考，默认上升
 
             if trend_up:
                 result[-1] = {
                     "high": max(h1, h2),
                     "low":  max(l1, l2),
-                    "date": bar["date"] if h2 >= h1 else prev["date"],
+                    "date": bar["date"] if h2 > h1 else prev["date"],
                 }
             else:
                 result[-1] = {
                     "high": min(h1, h2),
                     "low":  min(l1, l2),
-                    "date": bar["date"] if l2 <= l1 else prev["date"],
+                    "date": bar["date"] if l2 < l1 else prev["date"],
                 }
         else:
             result.append({"high": h2, "low": l2, "date": bar["date"]})
@@ -114,9 +118,13 @@ def find_fractals(bars: list[dict]) -> list[dict]:
     n = len(bars)
     for i in range(1, n - 1):
         prev, cur, nxt = bars[i - 1], bars[i], bars[i + 1]
-        if cur["high"] > prev["high"] and cur["high"] > nxt["high"]:
+        # 顶分型：中间K高价和低价均严格大于两侧（无包含后才能正确判断）
+        if (cur["high"] > prev["high"] and cur["high"] > nxt["high"]
+                and cur["low"] > prev["low"] and cur["low"] > nxt["low"]):
             fractals.append({"type": "top",    "idx": i, "date": cur["date"], "price": cur["high"]})
-        elif cur["low"] < prev["low"] and cur["low"] < nxt["low"]:
+        # 底分型：中间K高价和低价均严格小于两侧
+        elif (cur["low"] < prev["low"] and cur["low"] < nxt["low"]
+                and cur["high"] < prev["high"] and cur["high"] < nxt["high"]):
             fractals.append({"type": "bottom", "idx": i, "date": cur["date"], "price": cur["low"]})
     return fractals
 
@@ -142,20 +150,18 @@ def build_bi(fractals: list[dict]) -> list[dict]:
     for f in fractals[1:]:
         last = valid[-1]
         if f["type"] == last["type"]:
-            # 同向：取更极端
-            if f["type"] == "top" and f["price"] >= last["price"]:
+            # 同向：严格取更极端者（等价保留旧的，避免无意义前移日期）
+            if f["type"] == "top" and f["price"] > last["price"]:
                 valid[-1] = f
-            elif f["type"] == "bottom" and f["price"] <= last["price"]:
+            elif f["type"] == "bottom" and f["price"] < last["price"]:
                 valid[-1] = f
         else:
             if f["idx"] - last["idx"] >= 4:
                 valid.append(f)
             else:
-                # 距离不足：取更极端
-                if f["type"] == "top" and f["price"] > last["price"]:
-                    valid[-1] = f
-                elif f["type"] == "bottom" and f["price"] < last["price"]:
-                    valid[-1] = f
+                # 距离不足，无法构成有效笔：用更新的分型替换旧的，重新寻找端点
+                # 不做跨类型价格比较（top.price > bottom.price 几乎永远为真，毫无意义）
+                valid[-1] = f
 
     # 构建笔
     bi_list = []
@@ -258,7 +264,8 @@ def analyze_stock(args: tuple) -> tuple[str, list | None, int | None]:
         zs_list = find_zhongshu(bi_list)
 
         return code, zs_list, bars[-1]["date"]
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] {code}: {e}", file=sys.stderr)
         return code, None, None
 
 

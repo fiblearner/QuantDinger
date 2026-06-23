@@ -82,6 +82,15 @@ backend_api_python/data/memory/
 # ========================
 # 解压后的单股 JSON 目录（从 data/zhongshu.tar.gz 解压，不入库）
 /data/zhongshu/
+# 分钟K线数据（本地大文件，不入库）
+/data/kline_30m/
+/data/kline_1h/
+/data/kline_30m_hist/
+/data/kline_1h_hist/
+/data/kline_30m.tar.gz
+/data/kline_1h.tar.gz
+/data/kline_30m_fzline.tar.gz
+/data/kline_1h_fzline.tar.gz
 
 # ========================
 # i18n tooling
